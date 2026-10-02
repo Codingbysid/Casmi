@@ -1,0 +1,6 @@
+{
+  "title": "rdkit-cp312-wheel",
+  "subtitle": "RDKit 2025.9.5 manylinux cp312 wheel for offline Kaggle install",
+  "licenses": [{"name": "BSD-3-Clause"}],
+  "keywords": ["chemistry", "rdkit"]
+}
