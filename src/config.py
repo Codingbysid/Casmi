@@ -130,6 +130,9 @@ class Config:
     seed: int = 42
     val_fraction: float = 0.05
     max_train_spectra: int = 400_000
+    # Single experiment vs 0.139: keep the representative spectrum's observed
+    # neutral losses, precursor/CE/ion features, and adduct ID during training.
+    use_representative_metadata: bool = True
     log_every: int = 50
     ckpt_name: str = "spec2fp.pt"
     train_time_limit_s: float = 6.0 * 3600.0  # leave headroom inside the 9 h Kaggle cap

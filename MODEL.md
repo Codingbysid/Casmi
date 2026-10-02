@@ -137,6 +137,14 @@ Kaggle constraints: CPU or GPU, **internet off**, kernel source **< 1 MB** (the 
 | `kaggle_dataset/class2_candidates.parquet` | The 452,608-row library (also on Kaggle) |
 | `kaggle_submission.ipynb` | What gets uploaded to Kaggle |
 
+## Current experiment (not yet scored)
+
+One change on top of the 0.139 recipe: Spec2FP training now uses the representative spectrum’s real features instead of fabricated ones.
+
+The old training path set every row to adduct `[M+H]+`, positive mode, zero collision energy, and neutral losses from neutral mass. Inference uses the observed precursor m/z, adduct, collision energy, and ion mode. Nonzero adduct embeddings were never trained.
+
+`USE_REPRESENTATIVE_METADATA = True` in the notebook keeps `peak_nl`, `precursor_feat`, and `adduct_id` from `featurize_spectrum` on the chosen train spectrum (`src/infer.py` library builders, stored on `StructureIndex`, consumed by `dataset_from_structure_index`). Set the flag to `False` to restore the 0.139 tensors exactly. Ranking, neighbor blend, 120k/4 epochs/3 seeds, decoder off, and the Class 2 parquet are unchanged.
+
 ## Rules for the next change
 
 1. One hypothesis per Kaggle submit. A full run is ~5–9 h and costs a submission.

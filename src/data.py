@@ -13,7 +13,7 @@ import torch
 from torch.utils.data import Dataset
 
 from src.chem import formula_to_mass, morgan_fingerprint
-from src.config import Config
+from src.config import ADDUCT_VOCAB, NUM_ADDUCTS, Config
 from src.preprocessing import featurize_spectrum, stack_features
 
 
@@ -241,7 +241,14 @@ def dataset_from_structure_index(
     max_n: int | None = None,
     seed: int = 42,
 ) -> SpectrumFingerprintDataset:
-    """Train Spec2FP from the retrieval library (no second 2.5M-row parquet scan)."""
+    """Train from the library, retaining the representative's observed features.
+
+    The 0.139 baseline reconstructed every row as protonated/positive with no
+    collision energy and used neutral mass for peak losses. Inference instead
+    calls featurize_spectrum with the observed precursor and metadata. Copy its
+    saved tensors here so both paths use the same feature definition. Setting
+    cfg.use_representative_metadata=False reproduces the original dataset path.
+    """
     from src.preprocessing import bin_spectrum, precursor_feature_vector
 
     if getattr(index, "peak_mz", None) is None:
@@ -256,26 +263,55 @@ def dataset_from_structure_index(
     peak_mask = np.ascontiguousarray(index.peak_mask[take], dtype=np.float32)
     mass = np.ascontiguousarray(index.exact_mass[take], dtype=np.float32)
     fps = np.ascontiguousarray(index.fingerprints[take], dtype=np.float32)
-    peak_nl = np.clip(mass[:, None] - peak_mz, 0.0, None) * peak_mask
     n_take = int(peak_mz.shape[0])
     binned = np.zeros((n_take, cfg.n_mz_bins), dtype=np.float32)
-    feats = np.zeros((n_take, cfg.precursor_feat_dim), dtype=np.float32)
+    observed = bool(cfg.use_representative_metadata)
+    if observed:
+        expected = {
+            "peak_nl": (n, cfg.top_n_peaks),
+            "precursor_feat": (n, cfg.precursor_feat_dim),
+            "adduct_id": (n,),
+        }
+        for name, shape in expected.items():
+            arr = getattr(index, name, None)
+            if arr is None or arr.shape != shape:
+                raise ValueError(
+                    f"Representative metadata {name} must have shape {shape}; "
+                    "rebuild the train index with build_library_from_train/frame."
+                )
+        peak_nl = np.ascontiguousarray(index.peak_nl[take], dtype=np.float32)
+        feats = np.ascontiguousarray(index.precursor_feat[take], dtype=np.float32)
+        adduct_id = np.ascontiguousarray(index.adduct_id[take], dtype=np.int64)
+        if not np.isfinite(peak_nl).all() or not np.isfinite(feats).all():
+            raise ValueError("Missing or non-finite representative spectrum features")
+        if np.any((adduct_id < 0) | (adduct_id >= NUM_ADDUCTS)):
+            raise ValueError("Missing or invalid representative adduct IDs")
+    else:
+        # Keep this branch identical to the measured 0.139 feature construction.
+        peak_nl = np.clip(mass[:, None] - peak_mz, 0.0, None) * peak_mask
+        feats = np.zeros((n_take, cfg.precursor_feat_dim), dtype=np.float32)
+        adduct_id = np.zeros((n_take,), dtype=np.int64)
     for i in range(n_take):
         binned[i] = bin_spectrum(peak_mz[i], peak_int[i], peak_mask[i], cfg=cfg)
-        n_peaks = int(peak_mask[i].sum())
-        prec = float(mass[i]) + 1.007276
-        feats[i] = precursor_feature_vector(
-            precursor_mz=prec,
-            neutral_mass=float(mass[i]),
-            adduct="[M+H]+",
-            collision_energy=None,
-            ionization_mode="positive",
-            n_peaks=n_peaks,
-            cfg=cfg,
-        )
+        if not observed:
+            n_peaks = int(peak_mask[i].sum())
+            prec = float(mass[i]) + 1.007276
+            feats[i] = precursor_feature_vector(
+                precursor_mz=prec,
+                neutral_mass=float(mass[i]),
+                adduct="[M+H]+",
+                collision_energy=None,
+                ionization_mode="positive",
+                n_peaks=n_peaks,
+                cfg=cfg,
+            )
         if (i + 1) % 20_000 == 0:
             print(f"[dataset] binned {i+1}/{n_take}")
-    adduct_id = np.zeros((n_take,), dtype=np.int64)
+    ids, counts = np.unique(adduct_id, return_counts=True)
+    print(
+        f"[dataset] representative_metadata={observed} "
+        f"adduct_counts={dict(zip((ADDUCT_VOCAB[int(i)] for i in ids), counts.tolist()))}"
+    )
     return SpectrumFingerprintDataset(
         peak_mz=peak_mz,
         peak_intensity=peak_int,

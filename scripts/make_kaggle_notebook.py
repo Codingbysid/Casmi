@@ -83,6 +83,12 @@ Internet stays **OFF**. The first code cell installs RDKit from that wheelhouse.
 
 That parquet is the **full** NP set (train skeletons removed, generic 50–2000 Da). It is **not** filtered on the public `test.parquet` masses.
 
+**Single experiment vs 0.139:** preserve the representative spectrum's original
+neutral-loss, precursor/CE/ion, and adduct tensors when constructing the training
+dataset. The old path fabricated protonated-positive metadata for every row.
+`USE_REPRESENTATIVE_METADATA = False` restores that original feature construction.
+Keep the existing 0.139 Kaggle submission selected unless this run scores higher.
+
 Pipeline:
 1. Build a train-structure library (InChIKey14, exact mass, Morgan fingerprints, representative MS2).
 2. Train up to **3 Spec2FP seeds** on 120k unique train skeletons (4 epochs, ~1.5 h each) and average pre-sigmoid logits. Blend with train spectral neighbors (k=20, a=0.5).
@@ -234,6 +240,7 @@ PREFER_XLA = False            # TPU off: CPU/GPU path
 TRAIN_DECODER = False         # Class 3 analog shifts run without the SMILES decoder
 ENSEMBLE_SEEDS = 3            # average pre-sigmoid Spec2FP logits
 MAX_TRAIN_SPECTRA = 120_000   # V5/V6 0.139; 280k/6ep scored 0.126
+USE_REPRESENTATIVE_METADATA = True  # the only experiment: observed training features
 NUM_EPOCHS = 4
 BATCH_SIZE = 64
 TRAIN_TIME_LIMIT_S = 4.5 * 3600.0
@@ -465,6 +472,7 @@ cfg = get_config(
     batch_size=BATCH_SIZE,
     num_epochs=NUM_EPOCHS,
     max_train_spectra=MAX_TRAIN_SPECTRA,
+    use_representative_metadata=bool(USE_REPRESENTATIVE_METADATA),
     train_time_limit_s=TRAIN_TIME_LIMIT_S,
     top_n_peaks=TOP_N_PEAKS,
     n_mz_bins=N_MZ_BINS,

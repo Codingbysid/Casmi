@@ -28,6 +28,11 @@ class StructureIndex:
     formulas: np.ndarray | None = None  # object / str
     fp_packed: np.ndarray | None = None  # uint8 (N, fp_bits/8)
     ionization_mode: np.ndarray | None = None  # object / str
+    # Original featurize_spectrum outputs for the same representative as peak_mz.
+    # Optional for structure-only candidate libraries; required by corrected training.
+    peak_nl: np.ndarray | None = None  # (N, top_n)
+    precursor_feat: np.ndarray | None = None  # (N, precursor_feat_dim)
+    adduct_id: np.ndarray | None = None  # (N,)
 
     @classmethod
     def build(
@@ -42,6 +47,9 @@ class StructureIndex:
         formulas: list[str] | np.ndarray | None = None,
         fp_packed: np.ndarray | None = None,
         ionization_mode: list[str] | np.ndarray | None = None,
+        peak_nl: np.ndarray | None = None,
+        precursor_feat: np.ndarray | None = None,
+        adduct_id: np.ndarray | None = None,
     ) -> "StructureIndex":
         mass = np.asarray(exact_mass, dtype=np.float64)
         order = np.argsort(mass, kind="mergesort")
@@ -63,6 +71,11 @@ class StructureIndex:
             ionization_mode=None
             if ionization_mode is None
             else np.asarray(ionization_mode, dtype=object),
+            peak_nl=None if peak_nl is None else np.asarray(peak_nl, dtype=np.float32),
+            precursor_feat=None
+            if precursor_feat is None
+            else np.asarray(precursor_feat, dtype=np.float32),
+            adduct_id=None if adduct_id is None else np.asarray(adduct_id, dtype=np.int64),
         )
 
     def mass_window(

@@ -146,6 +146,9 @@ def build_library_from_train(
     peak_mz = np.zeros((len(keys), cfg.top_n_peaks), dtype=np.float32)
     peak_int = np.zeros((len(keys), cfg.top_n_peaks), dtype=np.float32)
     peak_mask = np.zeros((len(keys), cfg.top_n_peaks), dtype=np.float32)
+    peak_nl = np.zeros((len(keys), cfg.top_n_peaks), dtype=np.float32)
+    precursor_feat = np.full((len(keys), cfg.precursor_feat_dim), np.nan, dtype=np.float32)
+    adduct_id = np.full(len(keys), -1, dtype=np.int64)
     for i, k in enumerate(keys):
         feat = best_feat.get(k)
         if feat is None:
@@ -153,6 +156,9 @@ def build_library_from_train(
         peak_mz[i] = feat["peak_mz"]
         peak_int[i] = feat["peak_intensity"]
         peak_mask[i] = feat["peak_mask"]
+        peak_nl[i] = feat["peak_nl"]
+        precursor_feat[i] = feat["precursor_feat"]
+        adduct_id[i] = feat["adduct_id"]
 
     ion_mode = np.array(
         [str((best_feat.get(k) or {}).get("ionization_mode") or "") for k in keys],
@@ -168,6 +174,9 @@ def build_library_from_train(
         peak_mask=peak_mask,
         formulas=formulas,
         ionization_mode=ion_mode,
+        peak_nl=peak_nl,
+        precursor_feat=precursor_feat,
+        adduct_id=adduct_id,
     )
 
 
@@ -212,6 +221,9 @@ def build_library_from_frame(df: pd.DataFrame, cfg: Config) -> StructureIndex:
     peak_mz = np.stack([best_feat[k]["peak_mz"] for k in keys])
     peak_int = np.stack([best_feat[k]["peak_intensity"] for k in keys])
     peak_mask = np.stack([best_feat[k]["peak_mask"] for k in keys])
+    peak_nl = np.stack([best_feat[k]["peak_nl"] for k in keys])
+    precursor_feat = np.stack([best_feat[k]["precursor_feat"] for k in keys])
+    adduct_id = np.asarray([best_feat[k]["adduct_id"] for k in keys], dtype=np.int64)
     ion_mode = np.array(
         [str(best_feat[k].get("ionization_mode") or "") for k in keys],
         dtype=object,
@@ -226,6 +238,9 @@ def build_library_from_frame(df: pd.DataFrame, cfg: Config) -> StructureIndex:
         peak_mask=peak_mask,
         formulas=[formula_map[k] for k in keys],
         ionization_mode=ion_mode,
+        peak_nl=peak_nl,
+        precursor_feat=precursor_feat,
+        adduct_id=adduct_id,
     )
 
 
