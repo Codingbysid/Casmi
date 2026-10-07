@@ -345,6 +345,39 @@ def inchikey14_from_smiles(smiles: str | None) -> str:
     return ""
 
 
+@lru_cache(maxsize=500_000)
+def heavy_atom_graph_key(smiles: str | None) -> str:
+    """Canonical SMILES of the element-labelled heavy-atom graph (all bonds single).
+
+    Tautomer transforms move hydrogens and bond orders but never break heavy-atom
+    bonds, so two SMILES can share a tautomer-canonical InChIKey14 only if they
+    share this key. It costs ~0.4 ms against ~40 ms for canonicalization, which
+    lets dedup canonicalize only genuine collision candidates. Empty on failure.
+    """
+    mol = smiles_to_mol(smiles)
+    if mol is None:
+        return ""
+    try:
+        rw = Chem.RWMol(mol)
+        Chem.RemoveStereochemistry(rw)
+        for atom in rw.GetAtoms():
+            atom.SetFormalCharge(0)
+            atom.SetIsotope(0)
+            atom.SetNumExplicitHs(0)
+            atom.SetNoImplicit(True)
+            atom.SetIsAromatic(False)
+            atom.SetNumRadicalElectrons(0)
+        for bond in rw.GetBonds():
+            bond.SetBondType(Chem.BondType.SINGLE)
+            bond.SetIsAromatic(False)
+        skeleton = rw.GetMol()
+        skeleton.UpdatePropertyCache(strict=False)
+        Chem.FastFindRings(skeleton)
+        return Chem.MolToSmiles(skeleton, canonical=True)
+    except Exception:
+        return ""
+
+
 def canonical_smiles(smiles: str | None) -> str:
     mol = smiles_to_mol(smiles)
     if mol is None:

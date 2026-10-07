@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import zlib
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,7 @@ import torch
 from src.chem import (
     exact_mass_from_smiles,
     formula_to_mass,
+    heavy_atom_graph_key,
     inchikey14_from_smiles,
     morgan_fingerprint,
     plausible_neutral_masses,
@@ -337,6 +339,31 @@ class _Hit:
     tani: float = 0.0
     mass: float = 1.0
     n_match: float = 0.0
+    # Reranker features / provenance. Defaults keep older constructors valid.
+    frac: float = 0.0  # matched query-intensity fraction
+    fcos: float = 0.0  # fingerprint cosine vs predicted fp
+    ppm: float = 100.0  # |mass error| to the nearest plausible query mass
+    exact_mass: float = 0.0  # candidate monoisotopic mass
+    source: int = 0  # 1 train library, 2 external pool, 3 mass-shift analog
+    spec_evaluated: bool = False  # a spectrum comparison actually ran
+
+
+def _copy_hit(hit: "_Hit", *, key: str | None = None, score: float | None = None) -> "_Hit":
+    return _Hit(
+        hit.smiles,
+        hit.inchikey14 if key is None else key,
+        hit.score if score is None else float(score),
+        spec=hit.spec,
+        tani=hit.tani,
+        mass=hit.mass,
+        n_match=hit.n_match,
+        frac=hit.frac,
+        fcos=hit.fcos,
+        ppm=hit.ppm,
+        exact_mass=hit.exact_mass,
+        source=hit.source,
+        spec_evaluated=hit.spec_evaluated,
+    )
 
 
 def _collect_query_masses(
@@ -421,12 +448,15 @@ def _score_candidates(
 
     spec = np.zeros(cand_idx.size, dtype=np.float32)
     n_match = np.zeros(cand_idx.size, dtype=np.float32)
+    frac_all = np.zeros(cand_idx.size, dtype=np.float32)
+    evaluated = np.zeros(cand_idx.size, dtype=bool)
     spec_cap = 512
     if use_spectral and index.peak_mz is not None and cand_idx.size:
         if cand_idx.size > spec_cap:
             pick = np.argpartition(-mass_sc, spec_cap - 1)[:spec_cap]
         else:
             pick = np.arange(cand_idx.size)
+        evaluated[pick] = True
         spec_pick = np.zeros(pick.size, dtype=np.float32)
         match_pick = np.zeros(pick.size, dtype=np.float32)
         frac_pick = np.zeros(pick.size, dtype=np.float32)
@@ -458,6 +488,7 @@ def _score_candidates(
         spec_pick = np.where(few_peaks | weak_intensity, np.float32(0.0), spec_pick)
         spec[pick] = spec_pick
         n_match[pick] = match_pick
+        frac_all[pick] = frac_pick
 
     fps = _fingerprints_for(index, cand_idx, cfg)
     tani, fcos = fingerprint_scores(
@@ -473,8 +504,10 @@ def _score_candidates(
     else:
         scores = combine_scores(spec, tani, mass_sc, cfg, fp_cosine=fcos)
     scores = np.nan_to_num(scores, nan=0.0)
+    ppm = np.nan_to_num(dm / np.clip(cand_mass, 1e-6, None) * 1e6, nan=100.0)
     smiles = index.smiles[cand_idx]
     keys = index.inchikey14[cand_idx]
+    source = 2 if is_class2 else 1
     hits: list[_Hit] = []
     for i in range(cand_idx.size):
         smi = str(smiles[i])
@@ -488,6 +521,12 @@ def _score_candidates(
                 tani=float(tani[i]),
                 mass=float(mass_sc[i]),
                 n_match=float(n_match[i]),
+                frac=float(frac_all[i]),
+                fcos=float(fcos[i]),
+                ppm=float(ppm[i]),
+                exact_mass=float(cand_mass[i]),
+                source=source,
+                spec_evaluated=bool(evaluated[i]),
             )
         )
     hits.sort(key=lambda h: (-h.spec, -h.score) if use_spectral else (-h.score,))
@@ -499,7 +538,13 @@ def _skeleton_key(hit: _Hit) -> str:
     return inchikey14_from_smiles(hit.smiles) or hit.inchikey14 or hit.smiles
 
 
+def _graph_key(hit: _Hit) -> str:
+    """Heavy-atom graph key; equal canonical keys imply equal graph keys."""
+    return heavy_atom_graph_key(hit.smiles) or hit.inchikey14 or hit.smiles
+
+
 def _merge_hits(*groups: list[_Hit], top_k: int) -> list[_Hit]:
+    """Reference dedup: canonicalize every hit, keep the best score per key."""
     best: dict[str, _Hit] = {}
     for group in groups:
         for hit in group:
@@ -508,16 +553,55 @@ def _merge_hits(*groups: list[_Hit], top_k: int) -> list[_Hit]:
             key = _skeleton_key(hit)
             prev = best.get(key)
             if prev is None or hit.score > prev.score:
-                best[key] = _Hit(
-                    hit.smiles,
-                    key,
-                    hit.score,
-                    spec=hit.spec,
-                    tani=hit.tani,
-                    mass=hit.mass,
-                    n_match=hit.n_match,
-                )
+                best[key] = _copy_hit(hit, key=key)
     return sorted(best.values(), key=lambda h: -h.score)[: int(top_k)]
+
+
+def _emit_unique(
+    ordered: list[_Hit],
+    locked: list[_Hit],
+    top_k: int,
+    *,
+    locked_keys: list[str] | None = None,
+) -> list[_Hit]:
+    """Walk ``ordered`` (best first) and emit the first hit of each skeleton.
+
+    Produces the same sequence as ``_merge_hits`` on the pool minus aliases of
+    locked hits, but canonicalizes a SMILES only when another emitted or locked
+    hit shares its heavy-atom graph key. Everything else keeps its raw key.
+    """
+    if top_k <= 0:
+        return []
+    # graph key -> [[hit, canonical key or None], ...] over locked + emitted hits
+    seen_by_graph: dict[str, list[list[Any]]] = {}
+    for i, hit in enumerate(locked):
+        key = locked_keys[i] if locked_keys is not None and i < len(locked_keys) else _skeleton_key(hit)
+        seen_by_graph.setdefault(_graph_key(hit), []).append([hit, key])
+    out: list[_Hit] = []
+    for hit in ordered:
+        if not hit.smiles:
+            continue
+        g = _graph_key(hit)
+        mates = seen_by_graph.get(g)
+        if mates:
+            key = _skeleton_key(hit)
+            duplicate = False
+            for entry in mates:
+                if entry[1] is None:
+                    entry[1] = _skeleton_key(entry[0])
+                if entry[1] == key:
+                    duplicate = True
+                    break
+            if duplicate:
+                continue
+            mates.append([hit, key])
+            out.append(_copy_hit(hit, key=key))
+        else:
+            seen_by_graph[g] = [[hit, None]]
+            out.append(_copy_hit(hit, key=hit.inchikey14 or hit.smiles))
+        if len(out) >= int(top_k):
+            break
+    return out
 
 
 def _hits_to_smiles(hits: list[_Hit]) -> list[str]:
@@ -654,7 +738,21 @@ def _rank_mass_shifted_analogs(
         else:
             spec = np.array([0.0], dtype=np.float32)
             score = float(combine_scores(spec, t, mass_sc, cfg, fp_cosine=fcos)[0])
-        hits.append(_Hit(smi, key, score, spec=0.0, tani=float(t[0]), mass=float(mass_sc[0])))
+        hits.append(
+            _Hit(
+                smi,
+                key,
+                score,
+                spec=0.0,
+                tani=float(t[0]),
+                mass=float(mass_sc[0]),
+                fcos=float(fcos[0]),
+                ppm=float(dm[0] / max(mass, qmass, 1.0) * 1e6),
+                exact_mass=float(mass),
+                source=3,
+                spec_evaluated=False,
+            )
+        )
     hits.sort(key=lambda h: -h.score)
     return hits
 
@@ -787,15 +885,112 @@ def _linear_score(hit: _Hit, cfg: Config) -> float:
 
 
 def _with_linear_score(hit: _Hit, cfg: Config) -> _Hit:
-    return _Hit(
-        hit.smiles,
-        hit.inchikey14,
-        _linear_score(hit, cfg),
-        spec=hit.spec,
-        tani=hit.tani,
-        mass=hit.mass,
-        n_match=hit.n_match,
+    return _copy_hit(hit, score=_linear_score(hit, cfg))
+
+
+def _locked_hits(class1: list[_Hit], cut: float, top_k: int) -> list[_Hit]:
+    locked = [h for h in class1 if _is_class1_lock(h, cut)]
+    locked.sort(key=lambda h: (-h.spec, -h.score))
+    return locked[:top_k]
+
+
+def _unlocked_pool(
+    class1: list[_Hit],
+    class2: list[_Hit],
+    analog_hits: list[_Hit],
+    locked: list[_Hit],
+    cfg: Config,
+) -> list[_Hit]:
+    """Compete pool with the 0.150 linear score, best first (stable on ties)."""
+    locked_ids = {id(h) for h in locked}
+    pool = [_with_linear_score(h, cfg) for h in class1 if id(h) not in locked_ids]
+    pool += [_with_linear_score(h, cfg) for h in class2]
+    pool += [_with_linear_score(h, cfg) for h in analog_hits]
+    pool.sort(key=lambda h: -h.score)
+    return pool
+
+
+def _window_features(
+    window: list[_Hit],
+    pool: list[_Hit],
+    n_class2: int,
+    n_locked: int,
+    context: dict[str, Any] | None,
+) -> np.ndarray:
+    from src.rerank import window_feature_matrix
+
+    ctx = context or {}
+    if not window:
+        return window_feature_matrix(
+            spec=np.zeros(0),
+            n_match=np.zeros(0),
+            frac=np.zeros(0),
+            spec_evaluated=np.zeros(0),
+            tani=np.zeros(0),
+            fcos=np.zeros(0),
+            mass_sc=np.zeros(0),
+            ppm=np.zeros(0),
+            source=np.zeros(0),
+            lin_score=np.zeros(0),
+            lin_rank=np.zeros(0),
+            pool_max_tani=0.0,
+            pool_max_spec=0.0,
+            pool_max_fcos=0.0,
+            pool_size=len(pool),
+            n_class2=n_class2,
+            n_locked=n_locked,
+            query_mass=float(ctx.get("query_mass") or 0.0),
+            query_n_peaks=int(ctx.get("query_n_peaks") or 0),
+            n_groups=int(ctx.get("n_groups") or 1),
+        )
+    return window_feature_matrix(
+        spec=np.array([h.spec for h in window]),
+        n_match=np.array([h.n_match for h in window]),
+        frac=np.array([h.frac for h in window]),
+        spec_evaluated=np.array([1.0 if h.spec_evaluated else 0.0 for h in window]),
+        tani=np.array([h.tani for h in window]),
+        fcos=np.array([h.fcos for h in window]),
+        mass_sc=np.array([h.mass for h in window]),
+        ppm=np.array([h.ppm for h in window]),
+        source=np.array([h.source for h in window]),
+        lin_score=np.array([h.score for h in window]),
+        lin_rank=np.arange(len(window), dtype=np.float32),
+        pool_max_tani=max((h.tani for h in pool), default=0.0),
+        pool_max_spec=max((h.spec for h in pool), default=0.0),
+        pool_max_fcos=max((h.fcos for h in pool), default=0.0),
+        pool_size=len(pool),
+        n_class2=n_class2,
+        n_locked=n_locked,
+        query_mass=float(ctx.get("query_mass") or 0.0),
+        query_n_peaks=int(ctx.get("query_n_peaks") or 0),
+        n_groups=int(ctx.get("n_groups") or 1),
     )
+
+
+TRACE_TAIL = 30
+
+
+def _window_trace(window: list[_Hit], tail: list[_Hit], X: np.ndarray) -> dict[str, Any]:
+    return {
+        "window": {
+            "smiles": [h.smiles for h in window],
+            "raw_key": [h.inchikey14 for h in window],
+            "exact_mass": np.array([h.exact_mass for h in window], dtype=np.float64),
+            "source": np.array([h.source for h in window], dtype=np.int8),
+            "lin_score": np.array([h.score for h in window], dtype=np.float32),
+            "spec": np.array([h.spec for h in window], dtype=np.float32),
+            "n_match": np.array([h.n_match for h in window], dtype=np.float32),
+            "tani": np.array([h.tani for h in window], dtype=np.float32),
+            "features": np.asarray(X, dtype=np.float32),
+        },
+        "tail": {
+            "smiles": [h.smiles for h in tail[:TRACE_TAIL]],
+            "raw_key": [h.inchikey14 for h in tail[:TRACE_TAIL]],
+            "exact_mass": np.array([h.exact_mass for h in tail[:TRACE_TAIL]], dtype=np.float64),
+            "source": np.array([h.source for h in tail[:TRACE_TAIL]], dtype=np.int8),
+            "lin_score": np.array([h.score for h in tail[:TRACE_TAIL]], dtype=np.float32),
+        },
+    }
 
 
 def _merge_tiers(
@@ -805,19 +1000,59 @@ def _merge_tiers(
     cfg: Config,
     *,
     lock_cut: float | None = None,
+    reranker=None,
+    context: dict[str, Any] | None = None,
+    trace: dict[str, Any] | None = None,
 ) -> list[_Hit]:
-    """Lock cosine>=0.75 and >=5 peaks; compete the rest, including Class 2."""
+    """Lock cosine>=0.75 and >=5 peaks; compete the rest, including Class 2.
+
+    Without a reranker this reproduces the 0.150 ordering: locked hits by
+    cosine, then every unlocked candidate by the linear compete score, one
+    slot per tautomer-canonical skeleton. With a reranker, only the top
+    ``cfg.rerank_window`` unlocked candidates are reordered by the learned
+    score; the tail keeps the baseline order and the locks never move.
+    """
     cut = float(lock_cut if lock_cut is not None else getattr(cfg, "soft_merge_lock_cosine", CLASS1_LOCK_COSINE) or CLASS1_LOCK_COSINE)
     top_k = int(cfg.top_k)
-    locked = [h for h in class1 if _is_class1_lock(h, cut)]
-    locked.sort(key=lambda h: (-h.spec, -h.score))
-    locked = locked[:top_k]
-    locked_keys = {_skeleton_key(h) for h in locked}
+    locked = _locked_hits(class1, cut, top_k)
+    locked_keys = [_skeleton_key(h) for h in locked]
     remain = max(top_k - len(locked), 0)
-    weak_c1 = [_with_linear_score(h, cfg) for h in class1 if _skeleton_key(h) not in locked_keys]
-    valid_c2 = [_with_linear_score(h, cfg) for h in class2 if _skeleton_key(h) not in locked_keys]
-    analog_scored = [_with_linear_score(h, cfg) for h in analog_hits if _skeleton_key(h) not in locked_keys]
-    competed = _merge_hits(weak_c1, valid_c2, analog_scored, top_k=remain)
+    pool = _unlocked_pool(class1, class2, analog_hits, locked, cfg)
+    ordered = pool
+    if reranker is not None or trace is not None:
+        window_n = max(int(getattr(cfg, "rerank_window", 200) or 200), 1)
+        window = pool[:window_n]
+        tail = pool[window_n:]
+        n_class2 = sum(1 for h in pool if h.source == 2)
+        X = _window_features(window, pool, n_class2, len(locked), context)
+        if trace is not None:
+            trace.update(_window_trace(window, tail, X))
+            trace["locked"] = {
+                "smiles": [h.smiles for h in locked],
+                "key": list(locked_keys),
+                "spec": [float(h.spec) for h in locked],
+                "n_match": [float(h.n_match) for h in locked],
+                "tani": [float(h.tani) for h in locked],
+            }
+            trace["pool_size"] = len(pool)
+            trace["pool_key_crc"] = np.array(
+                [zlib.crc32(str(h.inchikey14).encode()) for h in pool], dtype=np.uint32
+            )
+            trace["n_class2_pool"] = int(n_class2)
+            trace["n_analog_pool"] = int(sum(1 for h in pool if h.source == 3))
+            trace["n_weak_c1_pool"] = int(sum(1 for h in pool if h.source == 1))
+            trace["window_n"] = int(window_n)
+        if reranker is not None and window:
+            from src.rerank import rerank_scores, reranked_order
+
+            scores = rerank_scores(reranker, X)
+            order = reranked_order(scores)
+            window = [window[int(i)] for i in order]
+            if trace is not None:
+                trace["rerank_scores"] = np.asarray(scores, dtype=np.float32)
+                trace["rerank_order"] = np.asarray(order, dtype=np.int32)
+        ordered = window + tail
+    competed = _emit_unique(ordered, locked, remain, locked_keys=locked_keys)
     return (locked + competed)[:top_k]
 
 
@@ -832,10 +1067,14 @@ def rank_molecules(
     tokenizer=None,
     reranker=None,
     formula_model=None,
+    trace_out: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, list[str]]:
-    """Lock cosine>=0.75 with >=5 peaks; compete weak train, Class 2, and analogs."""
-    from src.analogs import expand_smiles
+    """Lock cosine>=0.75 with >=5 peaks; compete weak train, Class 2, and analogs.
 
+    ``reranker`` (optional) reorders only the unlocked window; ``trace_out``
+    (optional dict) receives the per-molecule candidate trace used by the
+    validation harness so both arms can be scored on identical pools.
+    """
     lock_cut = float(getattr(cfg, "soft_merge_lock_cosine", CLASS1_LOCK_COSINE) or CLASS1_LOCK_COSINE)
     out: dict[str, list[str]] = {}
     n = len(molecule_features)
@@ -846,93 +1085,61 @@ def rank_molecules(
     n_shift = 0
     n_c2_placed = 0
     n_analog_placed = 0
-    c2_logged = False
-    analog_logged = False
+    if external_index is not None:
+        print(
+            "[class2] dynamic mass window lookup via np.searchsorted on sorted exact_mass "
+            f"(n_lib={len(external_index.smiles)} "
+            f"mass={float(np.min(external_index.exact_mass)):.1f}-"
+            f"{float(np.max(external_index.exact_mass)):.1f} Da; "
+            "not prefiltered on test.parquet)"
+        )
+        n_lib = len(external_index.smiles)
+        if 20_000 <= n_lib < 250_000:
+            print(
+                f"[class2] WARNING: n_lib={n_lib} looks like LOTUS-only (~133k). "
+                "V6 expects COCONUT ∪ LOTUS ≈ 400k."
+            )
+        if bool(getattr(cfg, "use_mass_shift", True)):
+            print("[analog] mass-shifted NP products compete with weak Class 1 and Class 2")
+    if reranker is not None:
+        print(
+            f"[rank] reranker=active window={int(getattr(cfg, 'rerank_window', 200))} "
+            "(locked Class 1 order preserved; unlocked window reordered by learned score)"
+        )
+    else:
+        print("[rank] reranker=none (0.150 linear compete score)")
     for i, (mid, feat) in enumerate(molecule_features.items()):
-        groups = feat.get("group_features") or [feat]
-        qmass = float(feat.get("neutral_mass") or 0.0)
-        class1 = _rank_one(feat, groups, pred_fps[mid], index, cfg)
-        locked = [h for h in class1 if _is_class1_lock(h, lock_cut)]
-        locked.sort(key=lambda h: (-h.spec, -h.score))
-        locked = locked[: int(cfg.top_k)]
-        if locked:
+        smiles, stats, trace = _rank_query(
+            feat,
+            pred_fps[mid],
+            index,
+            cfg,
+            external_index=external_index,
+            reranker=reranker,
+            lock_cut=lock_cut,
+            want_trace=trace_out is not None,
+            decoder=decoder,
+            tokenizer=tokenizer,
+        )
+        out[mid] = smiles
+        if trace_out is not None and trace is not None:
+            trace_out[mid] = trace
+        if stats["n_locked"]:
             n_mol_locked += 1
-        locked_keys = {_skeleton_key(h) for h in locked}
-        class2: list[_Hit] = []
-        analog_hits: list[_Hit] = []
         if external_index is not None:
-            if not c2_logged:
-                print(
-                    "[class2] dynamic mass window lookup via np.searchsorted on sorted exact_mass "
-                    f"(n_lib={len(external_index.smiles)} "
-                    f"mass={float(np.min(external_index.exact_mass)):.1f}-"
-                    f"{float(np.max(external_index.exact_mass)):.1f} Da; "
-                    "not prefiltered on test.parquet)"
-                )
-                n_lib = len(external_index.smiles)
-                if 20_000 <= n_lib < 250_000:
-                    print(
-                        f"[class2] WARNING: n_lib={n_lib} looks like LOTUS-only (~133k). "
-                        "V6 expects COCONUT ∪ LOTUS ≈ 400k."
-                    )
-                c2_logged = True
-            raw_c2 = _rank_fingerprint_only(feat, groups, pred_fps[mid], external_index, cfg)
-            if not raw_c2:
+            if stats["n_class2_hits"] == 0:
                 n_c2_empty += 1
-            class2 = [h for h in raw_c2 if _skeleton_key(h) not in locked_keys]
-            if class2:
+            else:
                 n_c2 += 1
-                n_c2_hits += len(class2)
-            remain_after_lock = max(int(cfg.top_k) - len(locked), 0)
-            if remain_after_lock > 0 and bool(getattr(cfg, "use_mass_shift", True)):
-                if not analog_logged:
-                    print(
-                        "[analog] mass-shifted NP products compete with weak Class 1 and Class 2"
-                    )
-                    analog_logged = True
-                analog_hits = [
-                    h
-                    for h in _rank_mass_shifted_analogs(
-                        feat, groups, pred_fps[mid], external_index, cfg
-                    )
-                    if _skeleton_key(h) not in locked_keys
-                ]
-                if analog_hits:
-                    n_shift += 1
-        analog_keys = {_skeleton_key(h) for h in analog_hits}
-        c2_keys = {_skeleton_key(h) for h in class2}
-        merged = _merge_tiers(class1, class2, analog_hits, cfg, lock_cut=lock_cut)
-        shifted = [h for h in merged if _skeleton_key(h) in analog_keys]
-        n_analog_placed += len(shifted)
-        n_c2_placed += sum(1 for h in merged if _skeleton_key(h) in c2_keys)
-        smiles = _hits_to_smiles(merged)[: cfg.top_k]
-        if len(smiles) < cfg.top_k:
-            analog_smi = expand_smiles(
-                smiles[:5] or _hits_to_smiles(class1[:5]),
-                query_mass=qmass,
-                mass_ppm=max(float(cfg.mass_ppm), 20.0),
-            )
-            smiles = merge_unique_smiles(smiles, analog_smi, top_k=cfg.top_k)
-        if len(smiles) < cfg.top_k and decoder is not None:
-            denovo = _class3_denovo(feat, pred_fps[mid], cfg, decoder, tokenizer)
-            smiles = merge_unique_smiles(smiles, denovo, top_k=cfg.top_k)
-        if len(smiles) < cfg.top_k:
-            smiles = merge_unique_smiles(
-                smiles,
-                _fingerprint_pad(pred_fps[mid], index, cfg, smiles),
-                top_k=cfg.top_k,
-            )
-        if len(smiles) < cfg.top_k:
-            smiles = merge_unique_smiles(
-                smiles,
-                _nearest_library_smiles(index, qmass, cfg.top_k),
-                top_k=cfg.top_k,
-            )
-        out[mid] = smiles[: cfg.top_k]
+                n_c2_hits += stats["n_class2_hits"]
+            if stats["n_analog_hits"]:
+                n_shift += 1
+        n_c2_placed += stats["n_class2_placed"]
+        n_analog_placed += stats["n_analog_placed"]
         if (i + 1) % 50 == 0:
             print(
-                f"[rank] {i+1}/{n} last_n={len(out[mid])} locked={len(locked)} "
-                f"class2_hits={len(class2)} shifted={len(shifted)}"
+                f"[rank] {i+1}/{n} last_n={len(out[mid])} locked={stats['n_locked']} "
+                f"class2_hits={stats['n_class2_hits']} shifted={stats['n_analog_placed']}"
             )
     print(
         f"[rank] molecules with locked Class 1 "
@@ -951,6 +1158,86 @@ def rank_molecules(
                 "Check that class2_candidates.parquet is attached and spans 50-2000 Da."
             )
     return out
+
+
+def _rank_query(
+    feat: dict[str, Any],
+    pred_fp: np.ndarray,
+    index: StructureIndex,
+    cfg: Config,
+    *,
+    external_index: StructureIndex | None = None,
+    reranker=None,
+    lock_cut: float | None = None,
+    want_trace: bool = False,
+    decoder=None,
+    tokenizer=None,
+) -> tuple[list[str], dict[str, int], dict[str, Any] | None]:
+    """Rank one molecule. Shared by production inference and the validation harness."""
+    from src.analogs import expand_smiles
+
+    cut = float(lock_cut if lock_cut is not None else getattr(cfg, "soft_merge_lock_cosine", CLASS1_LOCK_COSINE) or CLASS1_LOCK_COSINE)
+    top_k = int(cfg.top_k)
+    groups = feat.get("group_features") or [feat]
+    qmass = float(feat.get("neutral_mass") or 0.0)
+    class1 = _rank_one(feat, groups, pred_fp, index, cfg)
+    n_locked = len(_locked_hits(class1, cut, top_k))
+    class2: list[_Hit] = []
+    analog_hits: list[_Hit] = []
+    if external_index is not None:
+        class2 = _rank_fingerprint_only(feat, groups, pred_fp, external_index, cfg)
+        remain_after_lock = max(top_k - n_locked, 0)
+        if remain_after_lock > 0 and bool(getattr(cfg, "use_mass_shift", True)):
+            analog_hits = _rank_mass_shifted_analogs(feat, groups, pred_fp, external_index, cfg)
+    peak_mask = feat.get("peak_mask")
+    context = {
+        "n_locked": int(n_locked),
+        "query_mass": qmass,
+        "query_n_peaks": int(np.sum(peak_mask)) if isinstance(peak_mask, np.ndarray) else 0,
+        "n_groups": len(groups),
+    }
+    trace: dict[str, Any] | None = {"context": context} if want_trace else None
+    merged = _merge_tiers(
+        class1,
+        class2,
+        analog_hits,
+        cfg,
+        lock_cut=cut,
+        reranker=reranker,
+        context=context,
+        trace=trace,
+    )
+    stats = {
+        "n_locked": int(n_locked),
+        "n_class1_hits": len(class1),
+        "n_class2_hits": len(class2),
+        "n_analog_hits": len(analog_hits),
+        "n_class2_placed": sum(1 for h in merged if h.source == 2),
+        "n_analog_placed": sum(1 for h in merged if h.source == 3),
+        "n_merged": len(merged),
+    }
+    smiles = _hits_to_smiles(merged)[:top_k]
+    if len(smiles) < top_k:
+        analog_smi = expand_smiles(
+            smiles[:5] or _hits_to_smiles(class1[:5]),
+            query_mass=qmass,
+            mass_ppm=max(float(cfg.mass_ppm), 20.0),
+        )
+        smiles = merge_unique_smiles(smiles, analog_smi, top_k=top_k)
+    if len(smiles) < top_k and decoder is not None:
+        denovo = _class3_denovo(feat, pred_fp, cfg, decoder, tokenizer)
+        smiles = merge_unique_smiles(smiles, denovo, top_k=top_k)
+    if len(smiles) < top_k:
+        smiles = merge_unique_smiles(smiles, _fingerprint_pad(pred_fp, index, cfg, smiles), top_k=top_k)
+    if len(smiles) < top_k:
+        smiles = merge_unique_smiles(smiles, _nearest_library_smiles(index, qmass, top_k), top_k=top_k)
+    smiles = smiles[:top_k]
+    if trace is not None:
+        trace["merged_smiles"] = _hits_to_smiles(merged)[:top_k]
+        trace["merged_source"] = [int(h.source) for h in merged[:top_k]]
+        trace["final_smiles"] = list(smiles)
+        trace["stats"] = dict(stats)
+    return smiles, stats, trace
 
 
 def featurize_test_molecules(test_df: pd.DataFrame, cfg: Config) -> dict[str, dict[str, Any]]:
@@ -1006,6 +1293,7 @@ def predict_test(
     external_index: StructureIndex | None = None,
     reranker=None,
     formula_model=None,
+    trace_out: dict[str, dict[str, Any]] | None = None,
 ) -> pd.DataFrame:
     cfg = cfg or get_config()
     if test_df is None:
@@ -1025,9 +1313,10 @@ def predict_test(
         external_index = load_external_structure_index(None, cfg)
     if external_index is None:
         print("[class2] no LOTUS/COCONUT table attached — ranking Class 1 only")
-    # V4 reranker / formula head are disabled until Class 1 is recovered.
-    reranker = None
+    # The formula head stays off. The learned reranker is used when the caller
+    # passes one (the notebook does so only after the promotion rule passes).
     formula_model = None
+    print(f"[predict] reranker={'active' if reranker is not None else 'none'}")
 
     mol_feats = featurize_test_molecules(test_df, cfg)
     mids = list(mol_feats.keys())
@@ -1058,6 +1347,7 @@ def predict_test(
         tokenizer=tokenizer,
         reranker=reranker,
         formula_model=formula_model,
+        trace_out=trace_out,
     )
     ids = official_molecule_ids(cfg, test_df)
     n_empty = 0

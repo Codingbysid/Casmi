@@ -234,6 +234,19 @@ def dataset_from_dataframe(df: pd.DataFrame, cfg: Config) -> SpectrumFingerprint
     )
 
 
+def fitting_subset_indices(n: int, max_n: int | None, seed: int = 42) -> np.ndarray:
+    """Library rows used to fit Spec2FP: the exact RNG call the 0.139/0.150 runs made.
+
+    The validation harness draws its holdouts from the complement, so the
+    same function must define both sides of the split.
+    """
+    n = int(n)
+    if max_n is None or n <= int(max_n):
+        return np.arange(n)
+    rng = np.random.default_rng(int(seed))
+    return np.sort(rng.choice(n, size=int(max_n), replace=False))
+
+
 def dataset_from_structure_index(
     index,
     cfg: Config,
@@ -254,10 +267,7 @@ def dataset_from_structure_index(
     if getattr(index, "peak_mz", None) is None:
         raise ValueError("structure index has no representative peaks")
     n = int(index.smiles.shape[0])
-    rng = np.random.default_rng(seed)
-    take = np.arange(n)
-    if max_n is not None and n > int(max_n):
-        take = np.sort(rng.choice(n, size=int(max_n), replace=False))
+    take = fitting_subset_indices(n, max_n, seed)
     peak_mz = np.ascontiguousarray(index.peak_mz[take], dtype=np.float32)
     peak_int = np.ascontiguousarray(index.peak_intensity[take], dtype=np.float32)
     peak_mask = np.ascontiguousarray(index.peak_mask[take], dtype=np.float32)
@@ -312,7 +322,7 @@ def dataset_from_structure_index(
         f"[dataset] representative_metadata={observed} "
         f"adduct_counts={dict(zip((ADDUCT_VOCAB[int(i)] for i in ids), counts.tolist()))}"
     )
-    return SpectrumFingerprintDataset(
+    ds = SpectrumFingerprintDataset(
         peak_mz=peak_mz,
         peak_intensity=peak_int,
         peak_nl=peak_nl.astype(np.float32),
@@ -322,6 +332,8 @@ def dataset_from_structure_index(
         adduct_id=adduct_id,
         fingerprints=fps,
     )
+    ds.library_indices = np.asarray(take, dtype=np.int64)  # type: ignore[attr-defined]
+    return ds
 
 
 def assert_static_shapes(batch: dict[str, torch.Tensor | np.ndarray], cfg: Config) -> None:

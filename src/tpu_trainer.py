@@ -160,14 +160,19 @@ class _ValidationCheckpoint:
         step: int,
         completed_epochs: int,
         reason: str,
+        extra_meta: dict[str, Any] | None = None,
     ):
         extra: dict[str, Any] = {
             "epoch": int(epoch),
             "step": int(step),
             "stop_step": int(step),
             "completed_epochs": int(completed_epochs),
+            "num_epochs": int(cfg.num_epochs),
             "stop_reason": reason,
+            "seed": int(cfg.seed),
         }
+        if extra_meta:
+            extra.update(dict(extra_meta))
         if self.enabled and self.state is not None:
             model.load_state_dict(self.state)
             extra.update(self.best_metrics)
@@ -248,7 +253,10 @@ def train_spec2fp(
     time_limit_s: float | None = None,
     seed: int | None = None,
     ckpt_name: str | None = None,
+    extra_meta: dict[str, Any] | None = None,
 ) -> Spec2FP:
+    """Train one Spec2FP seed. ``extra_meta`` (e.g. fit-subset and config hashes)
+    is written into the checkpoint's ``extra`` so a later run can verify reuse."""
     cfg = cfg or get_config()
     if seed is not None:
         cfg.seed = int(seed)
@@ -320,6 +328,7 @@ def train_spec2fp(
                     step=global_step,
                     completed_epochs=completed_epochs,
                     reason="time_limit",
+                    extra_meta=extra_meta,
                 )
             if not use_xla:
                 batch = _move(batch, device)
@@ -367,4 +376,5 @@ def train_spec2fp(
         step=global_step,
         completed_epochs=completed_epochs,
         reason="epochs_complete",
+        extra_meta=extra_meta,
     )

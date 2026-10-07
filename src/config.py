@@ -108,6 +108,9 @@ class Config:
     use_neighbor_fp: bool = True
     use_mass_shift: bool = True
     ensemble_seeds: int = 3
+    # Learned reranker (experiment): rescore only the top-N unlocked candidates
+    # by the 0.150 compete score; the tail keeps its baseline order.
+    rerank_window: int = 200
 
     # Model
     d_model: int = 256
