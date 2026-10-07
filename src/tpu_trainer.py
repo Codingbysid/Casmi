@@ -122,6 +122,78 @@ def load_model(path: Path | str, cfg: Config | None = None, map_location: str | 
     return model
 
 
+class _ValidationCheckpoint:
+    """Keep an independent snapshot of this run's best finite validation state.
+
+    The snapshot includes buffers (especially BatchNorm running statistics).
+    Loading a previous run's file is deliberately avoided: a timeout before
+    the first validation must not accidentally select a stale checkpoint.
+    """
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+        self.best_loss = float("inf")
+        self.best_epoch = -1
+        self.best_step = 0
+        self.best_metrics: dict[str, float] = {}
+        self.state: dict[str, torch.Tensor] | None = None
+
+    def consider(self, model, stats: dict[str, float], *, epoch: int, step: int) -> bool:
+        loss = float(stats["val_loss"])
+        if not math.isfinite(loss) or loss >= self.best_loss:
+            return False
+        self.best_loss = loss
+        self.best_epoch = int(epoch)
+        self.best_step = int(step)
+        self.best_metrics = {k: float(v) for k, v in stats.items()}
+        if self.enabled:
+            # detach().cpu() alone aliases CPU model storage; clone is essential.
+            self.state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        return True
+
+    def finish(
+        self,
+        model,
+        cfg: Config,
+        *,
+        epoch: int,
+        step: int,
+        completed_epochs: int,
+        reason: str,
+    ):
+        extra: dict[str, Any] = {
+            "epoch": int(epoch),
+            "step": int(step),
+            "stop_step": int(step),
+            "completed_epochs": int(completed_epochs),
+            "stop_reason": reason,
+        }
+        if self.enabled and self.state is not None:
+            model.load_state_dict(self.state)
+            extra.update(self.best_metrics)
+            extra.update(epoch=self.best_epoch, step=self.best_step, selection="best_validation")
+            print(
+                f"[checkpoint] seed={cfg.seed} selected=best_validation "
+                f"epoch={self.best_epoch + 1} step={self.best_step} "
+                f"val_loss={self.best_loss:.4f} stop={reason} stop_step={step} "
+                f"completed_epochs={completed_epochs}/{cfg.num_epochs}"
+            )
+        else:
+            selection = "last_no_validation" if self.enabled else "last_baseline"
+            extra["selection"] = selection
+            print(
+                f"[checkpoint] seed={cfg.seed} selected={selection} "
+                f"stop={reason} stop_step={step} "
+                f"completed_epochs={completed_epochs}/{cfg.num_epochs}"
+            )
+        # The saved file and returned model must represent the same selection.
+        # On the experiment path this writes the restored best, never the tail.
+        save_checkpoint(model, cfg.checkpoint_path, cfg, extra=extra)
+        if self.enabled:
+            model.eval()
+        return model
+
+
 def split_dataset(ds: Dataset, val_fraction: float, seed: int) -> tuple[Dataset, Dataset]:
     n = len(ds)
     n_val = max(1, int(round(n * val_fraction))) if n > 1 else 0
@@ -226,7 +298,8 @@ def train_spec2fp(
     t0 = time.time()
     limit = cfg.train_time_limit_s if time_limit_s is None else time_limit_s
     global_step = 0
-    best_val = float("inf")
+    selection = _ValidationCheckpoint(enabled=cfg.restore_best_checkpoint)
+    completed_epochs = 0
     print(f"[train] device={device} xla={use_xla} n_train={len(train_ds)} n_val={len(val_ds)}")
 
     for epoch in range(cfg.num_epochs):
@@ -240,8 +313,14 @@ def train_spec2fp(
         for batch in iterator:
             if limit and (time.time() - t0) > limit:
                 print("[train] time limit reached, stopping")
-                save_checkpoint(model, cfg.checkpoint_path, cfg, extra={"epoch": epoch, "step": global_step})
-                return model
+                return selection.finish(
+                    model,
+                    cfg,
+                    epoch=epoch,
+                    step=global_step,
+                    completed_epochs=completed_epochs,
+                    reason="time_limit",
+                )
             if not use_xla:
                 batch = _move(batch, device)
             n = int(batch["peak_mz"].shape[0])
@@ -269,17 +348,23 @@ def train_spec2fp(
         if val_loader is not None and len(val_ds) > 0:
             stats = evaluate(model, val_loader, device, cfg, criterion, use_xla)
             msg += " " + " ".join(f"{k}={v:.4f}" for k, v in stats.items())
-            if stats["val_loss"] < best_val:
-                best_val = stats["val_loss"]
+            if selection.consider(model, stats, epoch=epoch, step=global_step):
                 save_checkpoint(
                     model,
                     cfg.checkpoint_path,
                     cfg,
-                    extra={"epoch": epoch, "val_loss": best_val},
+                    extra={"epoch": epoch, "step": global_step, **stats},
                 )
         else:
             save_checkpoint(model, cfg.checkpoint_path, cfg, extra={"epoch": epoch})
+        completed_epochs = epoch + 1
         print(msg)
 
-    save_checkpoint(model, cfg.checkpoint_path, cfg, extra={"epoch": cfg.num_epochs, "step": global_step})
-    return model
+    return selection.finish(
+        model,
+        cfg,
+        epoch=cfg.num_epochs,
+        step=global_step,
+        completed_epochs=completed_epochs,
+        reason="epochs_complete",
+    )

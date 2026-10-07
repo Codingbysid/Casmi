@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Iterable
@@ -24,6 +25,19 @@ except Exception:  # pragma: no cover - environment without RDKit
     rdFingerprintGenerator = None  # type: ignore
     _HAS_RDKIT = False
     _MORGAN_GEN = None
+
+# Competition InChIKey14 is computed after RDKit tautomer canonicalization.
+# The enumerator is not thread-safe; Canonicalize runs under _TAUTOMER_LOCK.
+_TAUTOMER_ENUMERATOR = None
+_TAUTOMER_LOCK = threading.Lock()
+if _HAS_RDKIT:
+    try:
+        from rdkit.Chem.MolStandardize import rdMolStandardize
+
+        _TAUTOMER_ENUMERATOR = rdMolStandardize.TautomerEnumerator()
+        _TAUTOMER_ENUMERATOR.SetMaxTransforms(1000)
+    except Exception:
+        _TAUTOMER_ENUMERATOR = None
 
 
 _FORMULA_TOKEN = re.compile(r"([A-Z][a-z]?)(\d*)")
@@ -287,10 +301,8 @@ def smiles_to_mol(smiles: str | None):
     return mol
 
 
-def inchikey14_from_smiles(smiles: str | None) -> str:
-    """First InChIKey block (14 chars) after RDKit canonicalization. Empty on failure."""
-    mol = smiles_to_mol(smiles)
-    if mol is None:
+def _inchikey14_from_mol(mol) -> str:
+    if mol is None or Chem is None:
         return ""
     try:
         key = Chem.MolToInchiKey(mol)
@@ -299,6 +311,38 @@ def inchikey14_from_smiles(smiles: str | None) -> str:
     if not key:
         return ""
     return key.split("-")[0][:14]
+
+
+def _tautomer_canonical_mol(mol):
+    """Return the RDKit canonical tautomer, or ``mol`` if enumeration fails."""
+    if mol is None or _TAUTOMER_ENUMERATOR is None:
+        return mol
+    try:
+        with _TAUTOMER_LOCK:
+            canon = _TAUTOMER_ENUMERATOR.Canonicalize(mol)
+    except Exception:
+        return mol
+    return mol if canon is None else canon
+
+
+@lru_cache(maxsize=200_000)
+def inchikey14_from_smiles(smiles: str | None) -> str:
+    """First InChIKey block after tautomer canonicalization. Empty on failure.
+
+    The competition metric hashes InChIKey14 from
+    ``TautomerEnumerator().Canonicalize(mol)``. Keto/enol and amide/imidic
+    forms of one skeleton must share this key.
+    """
+    mol = smiles_to_mol(smiles)
+    if mol is None:
+        return ""
+    canon = _tautomer_canonical_mol(mol)
+    key = _inchikey14_from_mol(canon)
+    if key:
+        return key
+    if canon is not mol:
+        return _inchikey14_from_mol(mol)
+    return ""
 
 
 def canonical_smiles(smiles: str | None) -> str:

@@ -123,7 +123,7 @@ Kaggle constraints: CPU or GPU, **internet off**, kernel source **< 1 MB** (the 
 | `src/preprocessing.py` | Peak clean, binning, per-molecule aggregation |
 | `src/data.py` | Parquet streaming, `dataset_from_structure_index` |
 | `src/model.py` | `Spec2FP`, focal BCE |
-| `src/tpu_trainer.py` | CPU/GPU training loop, seed and time-limit overrides |
+| `src/tpu_trainer.py` | CPU/GPU training loop. Focal BCE only. Optional best-checkpoint restore is off in the notebook. |
 | `src/retrieval.py` | `StructureIndex`, modified cosine, mass window |
 | `src/neighbors.py` | Binned cosine kNN fingerprint blend |
 | `src/ranker.py` | Linear score, dedup, submission CSV |
@@ -132,18 +132,21 @@ Kaggle constraints: CPU or GPU, **internet off**, kernel source **< 1 MB** (the 
 | `src/calibration.py` | Optional OR-merge probabilities. Ranking score used in the compete pool is the linear mix above, not only this table. |
 | `src/models/smiles_decoder.py` | Class 3 decoder. **Disabled.** |
 | `src/formula_head.py`, `src/rerank.py` | Built earlier, **disabled** in `predict_test` |
-| `scripts/make_kaggle_notebook.py` | Emits `kaggle_submission.ipynb` |
+| `scripts/make_kaggle_notebook.py` | Emits `kaggle_submission.ipynb` and `kaggle_gpu_submission.ipynb` |
 | `scripts/build_class2_np.py` | Rebuilds the COCONUT ∪ LOTUS parquet. Needs `train.parquet` locally, which is not on disk. |
 | `kaggle_dataset/class2_candidates.parquet` | The 452,608-row library (also on Kaggle) |
 | `kaggle_submission.ipynb` | What gets uploaded to Kaggle |
 
 ## Current experiment (not yet scored)
 
-One change on top of the 0.139 recipe: Spec2FP training now uses the representative spectrum’s real features instead of fabricated ones.
+Three ranking changes against the 0.139 recipe. Training stays focal BCE, 3 seeds, 120k structures, 4 epochs, neighbor blend on, decoder off. The candidate-ranking loss from the GPU v2 run failed its holdout gate (the public 0.137 was the focal-only control) and is not in this notebook. `USE_REPRESENTATIVE_METADATA` and `RESTORE_BEST_CHECKPOINT` stay false.
 
-The old training path set every row to adduct `[M+H]+`, positive mode, zero collision energy, and neutral losses from neutral mass. Inference uses the observed precursor m/z, adduct, collision energy, and ion mode. Nonzero adduct embeddings were never trained.
+1. Modified cosine is 0 unless at least 4 peaks match and those peaks cover at least 15% of query intensity. Supported matches are scaled by `sqrt(n_hits / 8)`.
+2. A Class 1 lock requires cosine ≥ 0.75 and at least 5 matched peaks. The previous run locked 339/400 molecules. The log line is `[rank] molecules with locked Class 1 (cosine>=0.75, n_match>=5)`.
+3. Class 2 and other hits with no verified spectrum score `0.92 * (0.78 * tanimoto + 0.22 * mass)` instead of treating a missing spectrum as a 0.42 penalty. Verified spectral hits still use `0.42 / 0.46 / 0.12`.
+4. InChIKey14 dedup runs `TautomerEnumerator.Canonicalize` before `MolToInchiKey`, matching the competition metric.
 
-`USE_REPRESENTATIVE_METADATA = True` in the notebook keeps `peak_nl`, `precursor_feat`, and `adduct_id` from `featurize_spectrum` on the chosen train spectrum (`src/infer.py` library builders, stored on `StructureIndex`, consumed by `dataset_from_structure_index`). Set the flag to `False` to restore the 0.139 tensors exactly. Ranking, neighbor blend, 120k/4 epochs/3 seeds, decoder off, and the Class 2 parquet are unchanged.
+The final log also prints `class2_slots`. That count should rise above the 206 slots in the false-lock run if the gates fire. Keep 0.139 selected until a public score is strictly higher. This does not by itself establish 0.25 or 0.350.
 
 ## Rules for the next change
 

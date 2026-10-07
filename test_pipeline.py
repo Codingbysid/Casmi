@@ -166,16 +166,17 @@ def test_class2_merges_when_class1_is_full() -> None:
     _assert(len(merged) == 25, len(merged))
 
     cfg = get_config()
-    locked_hit = _Hit("CCO", "LFQSCWFLJHTTHZ", score=0.35, spec=0.91, tani=0.40, mass=1.0)
-    noisy_c2 = _Hit(phenol, key, score=0.99, spec=0.0, tani=0.85, mass=1.0)
-    _assert(locked_hit.spec >= CLASS1_LOCK_COSINE, locked_hit.spec)
+    locked_hit = _Hit("CCO", "LFQSCWFLJHTTHZ", score=0.35, spec=0.91, tani=0.40, mass=1.0, n_match=8)
+    noisy_c2 = _Hit(phenol, key, score=0.99, spec=0.0, tani=0.85, mass=1.0, n_match=0)
+    _assert(locked_hit.spec >= CLASS1_LOCK_COSINE and locked_hit.n_match >= 5, locked_hit)
     locked_order = _hits_to_smiles(_merge_tiers([locked_hit], [noisy_c2], [], cfg))
     _assert(locked_order[0] == "CCO", locked_order[:3])
     _assert(phenol in locked_order, locked_order[:5])
 
-    near_lock = _Hit("CCO", "LFQSCWFLJHTTHZ", score=0.40, spec=0.76, tani=0.20, mass=1.0)
-    near_order = _hits_to_smiles(_merge_tiers([near_lock], [noisy_c2], [], cfg))
-    _assert(near_order[0] == "CCO", near_order[:3])
+    # Cosine 0.76 from only two peaks is not a lock; Class 2 can outrank it.
+    false_lock = _Hit("CCO", "LFQSCWFLJHTTHZ", score=0.40, spec=0.76, tani=0.20, mass=1.0, n_match=2)
+    false_order = _hits_to_smiles(_merge_tiers([false_lock], [noisy_c2], [], cfg))
+    _assert(false_order[0] == phenol, false_order[:3])
 
     # Low-cosine train decoys lose to high-Tanimoto Class 2, but are not dropped.
     weak_decoys = [

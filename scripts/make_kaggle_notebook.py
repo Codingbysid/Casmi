@@ -58,20 +58,21 @@ def main() -> None:
         "name": "python3",
     }
     nb.metadata["language_info"] = {"name": "python", "pygments_lexer": "ipython3"}
-    # CPU session by default (TPU queue is often full). GPU is used if the session has one.
-    nb.metadata["accelerator"] = "none"
+    # GPU session. Internet stays off. The model size is the 0.139 net even on CUDA.
+    nb.metadata["accelerator"] = "GPU"
     nb.metadata["kaggle"] = {
-        "accelerator": "none",
+        "accelerator": "gpu",
         "isInternetEnabled": False,
+        "isGpuEnabled": True,
         "language": "python",
         "sourceType": "notebook",
     }
 
     cell_md(
         nb,
-        """# Enveda CASMI 2026 — Molecule ID from Mass Spectra (CPU / GPU)
+        """# Enveda CASMI 2026 — Molecule ID from Mass Spectra (GPU)
 
-Configured for **Kaggle Run All** with **internet off**. No TPU required.
+Configured for **Kaggle Run All** on a **CUDA GPU** with **internet off**. No TPU.
 
 Attach **three** inputs (Kaggle kernels must stay under **1 MB**, so the NP pool and RDKit wheels cannot live inside the notebook):
 
@@ -83,16 +84,18 @@ Internet stays **OFF**. The first code cell installs RDKit from that wheelhouse.
 
 That parquet is the **full** NP set (train skeletons removed, generic 50–2000 Da). It is **not** filtered on the public `test.parquet` masses.
 
-**Single experiment vs 0.139:** preserve the representative spectrum's original
-neutral-loss, precursor/CE/ion, and adduct tensors when constructing the training
-dataset. The old path fabricated protonated-positive metadata for every row.
-`USE_REPRESENTATIVE_METADATA = False` restores that original feature construction.
+**Experiment vs 0.139:** stop one- and two-peak Class 1 locks, score Class 2 on
+fingerprint and mass instead of a forced spectral zero, and dedup InChIKey14
+after RDKit tautomer canonicalization. Training stays focal BCE on 3 seeds.
+The rejected candidate-ranking loss is not in this run.
+`USE_REPRESENTATIVE_METADATA = False` and `RESTORE_BEST_CHECKPOINT = False`
+keep the 0.139 feature path and last-epoch checkpoint selection.
 Keep the existing 0.139 Kaggle submission selected unless this run scores higher.
 
 Pipeline:
 1. Build a train-structure library (InChIKey14, exact mass, Morgan fingerprints, representative MS2).
 2. Train up to **3 Spec2FP seeds** on 120k unique train skeletons (4 epochs, ~1.5 h each) and average pre-sigmoid logits. Blend with train spectral neighbors (k=20, a=0.5).
-3. Rank: lock Class 1 if modified cosine ≥ 0.75. Remaining slots merge weak train hits, Class 2 COCONUT, and mass-shifted analogs by `0.42*spec + 0.46*tani + 0.12*mass`.
+3. Rank: lock Class 1 only if modified cosine ≥ 0.75 **and** at least 5 peaks match. Matches with fewer than 4 peaks, or under 15% of query intensity, score 0. Unlocked train hits with real spectral support use `0.42*spec + 0.46*tani + 0.12*mass`. Class 2 and analogs use `0.92 * (0.78*tani + 0.22*mass)`.
 4. Fill leftover slots from attached COCONUT ∪ LOTUS (`class2_candidates.parquet`, mass filter at query time). Analog parents are retrieved at ±sugar/CH2/O/acetyl mass shifts.
 5. Write **exactly 25** unique InChIKey14 guesses.
 
@@ -227,8 +230,8 @@ print("HAS_RDKIT", True, "rdkit", _rdkit_ok()[1])
     cell_code(
         nb,
         """
-# ===== Fully configured for Run All on Kaggle CPU (9 h) =====
-# Session: CPU (or GPU). Do not start a TPU session.
+# ===== Fully configured for Run All on Kaggle GPU =====
+# Session: CUDA GPU. Do not start a TPU session.
 # Internet: OFF.
 # Add Data:
 #   1) Enveda CASMI 2026 competition
@@ -240,7 +243,8 @@ PREFER_XLA = False            # TPU off: CPU/GPU path
 TRAIN_DECODER = False         # Class 3 analog shifts run without the SMILES decoder
 ENSEMBLE_SEEDS = 3            # average pre-sigmoid Spec2FP logits
 MAX_TRAIN_SPECTRA = 120_000   # V5/V6 0.139; 280k/6ep scored 0.126
-USE_REPRESENTATIVE_METADATA = True  # the only experiment: observed training features
+USE_REPRESENTATIVE_METADATA = False  # 0.139 feature path; metadata experiment already ran
+RESTORE_BEST_CHECKPOINT = False      # no demonstrated gain; do not mix with this ranking run
 NUM_EPOCHS = 4
 BATCH_SIZE = 64
 TRAIN_TIME_LIMIT_S = 4.5 * 3600.0
@@ -467,12 +471,13 @@ def find_competition_dir() -> Path:
 data_dir = find_competition_dir()
 print("competition data_dir", data_dir)
 
-# CPU-sized model; GPU sessions get a slightly larger batch automatically after device pick.
+# Same 0.139-sized net on GPU and CPU. Do not enlarge the model on CUDA.
 cfg = get_config(
     batch_size=BATCH_SIZE,
     num_epochs=NUM_EPOCHS,
     max_train_spectra=MAX_TRAIN_SPECTRA,
     use_representative_metadata=bool(USE_REPRESENTATIVE_METADATA),
+    restore_best_checkpoint=bool(RESTORE_BEST_CHECKPOINT),
     train_time_limit_s=TRAIN_TIME_LIMIT_S,
     top_n_peaks=TOP_N_PEAKS,
     n_mz_bins=N_MZ_BINS,
@@ -535,12 +540,7 @@ print("elapsed_s", round(time.time() - T_START, 1))
         nb,
         """
 device, use_xla = get_device(prefer_xla=bool(PREFER_XLA))
-if str(device).startswith("cuda"):
-    cfg.batch_size = max(cfg.batch_size, 128)
-    cfg.d_model = 256
-    cfg.n_heads = 8
-    cfg.n_transformer_layers = 3
-print("train device", device, "xla", use_xla)
+print("train device", device, "xla", use_xla, "d_model", cfg.d_model, "batch", cfg.batch_size)
 
 if FAST_DEV_RUN:
     cfg.num_epochs = 1
@@ -762,7 +762,7 @@ print("done")
 """,
     )
 
-    for name in ("kaggle_submission.ipynb", "kaggle_submission_tpu.ipynb"):
+    for name in ("kaggle_submission.ipynb", "kaggle_gpu_submission.ipynb", "kaggle_submission_tpu.ipynb"):
         out = ROOT / name
         nbf.write(nb, out)
         nbytes = out.stat().st_size

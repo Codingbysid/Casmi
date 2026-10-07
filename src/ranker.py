@@ -45,9 +45,12 @@ def dedup_inchikey14(
     inchikey14: Sequence[str] | None = None,
     top_k: int = 25,
 ) -> list[str]:
-    """Keep the highest-scoring SMILES per RDKit InChIKey14, then take ``top_k``.
+    """Keep the highest-scoring SMILES per tautomer-canonical InChIKey14.
 
-    Submitting two stereoisomers of the same skeleton wastes an MRR@25 slot.
+    Stereoisomers and tautomers (keto/enol, amide/imidic) share one skeleton
+    under the competition metric, so a second form would waste an MRR@25 slot.
+    The key is recomputed from SMILES. A stored key is only a fallback when
+    RDKit cannot parse the SMILES.
     """
     order = np.argsort(-np.asarray(scores, dtype=np.float64))
     seen: set[str] = set()
@@ -56,12 +59,9 @@ def dedup_inchikey14(
         smi = str(smiles[int(idx)])
         if not smi or smi.lower() in {"nan", "none"}:
             continue
-        if inchikey14 is not None:
+        key = inchikey14_from_smiles(smi)
+        if not key and inchikey14 is not None:
             key = str(inchikey14[int(idx)] or "")
-        else:
-            key = ""
-        if not key:
-            key = inchikey14_from_smiles(smi)
         if not key:
             key = f"RAW::{smi}"
         if key in seen:

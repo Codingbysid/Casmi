@@ -35,7 +35,14 @@ from src.ranker import (
     sanitize_guesses,
     write_submission_csv,
 )
-from src.retrieval import StructureIndex, fingerprint_knn, load_external_structure_index, modified_cosine
+from src.retrieval import (
+    MIN_MATCHED_PEAKS,
+    MIN_QUERY_INTENSITY_FRACTION,
+    StructureIndex,
+    fingerprint_knn,
+    load_external_structure_index,
+    modified_cosine,
+)
 from src.tpu_trainer import _forward, _move, _pad_to_batch_size, get_device, load_model
 
 
@@ -422,8 +429,9 @@ def _score_candidates(
             pick = np.arange(cand_idx.size)
         spec_pick = np.zeros(pick.size, dtype=np.float32)
         match_pick = np.zeros(pick.size, dtype=np.float32)
+        frac_pick = np.zeros(pick.size, dtype=np.float32)
         for g in groups:
-            s, m = modified_cosine(
+            s, m, frac = modified_cosine(
                 g["peak_mz"],
                 g["peak_intensity"],
                 g["peak_mask"],
@@ -434,10 +442,20 @@ def _score_candidates(
                 cand_mass[pick].astype(np.float32),
                 cfg.modified_cosine_mz_tol,
                 return_n_match=True,
+                return_intensity_fraction=True,
             )
             better = s > spec_pick
-            match_pick = np.where(better, m, match_pick)
+            # Keep support stats when the gated score ties at zero, so the
+            # intensity and peak-count gates below still see the raw match.
+            take = better | ((s == spec_pick) & (m > match_pick))
+            match_pick = np.where(take, m, match_pick)
+            frac_pick = np.where(take, frac, frac_pick)
             spec_pick = np.maximum(spec_pick, s)
+        # modified_cosine already zeros weak support. Repeat the gates here so
+        # a one- or two-peak cosine cannot survive into the Class 1 lock.
+        few_peaks = match_pick < float(MIN_MATCHED_PEAKS)
+        weak_intensity = (match_pick > 0) & (frac_pick < float(MIN_QUERY_INTENSITY_FRACTION))
+        spec_pick = np.where(few_peaks | weak_intensity, np.float32(0.0), spec_pick)
         spec[pick] = spec_pick
         n_match[pick] = match_pick
 
@@ -476,13 +494,18 @@ def _score_candidates(
     return hits
 
 
+def _skeleton_key(hit: _Hit) -> str:
+    """Tautomer-canonical InChIKey14, so keto/enol forms share one slot."""
+    return inchikey14_from_smiles(hit.smiles) or hit.inchikey14 or hit.smiles
+
+
 def _merge_hits(*groups: list[_Hit], top_k: int) -> list[_Hit]:
     best: dict[str, _Hit] = {}
     for group in groups:
         for hit in group:
             if not hit.smiles:
                 continue
-            key = hit.inchikey14 or inchikey14_from_smiles(hit.smiles) or hit.smiles
+            key = _skeleton_key(hit)
             prev = best.get(key)
             if prev is None or hit.score > prev.score:
                 best[key] = _Hit(
@@ -727,17 +750,40 @@ def _hits_from_smiles(
 
 
 CLASS1_LOCK_COSINE = 0.75
+CLASS1_LOCK_MIN_PEAKS = 5
+# Database-only hits have no MS2. Renormalize onto fingerprint + mass, then
+# apply a small prior so an equally strong spectral match still ranks first.
+CLASS2_FP_WEIGHT = 0.78
+CLASS2_MASS_WEIGHT = 0.22
+CLASS2_PRIOR = 0.92
+
+
+def _is_class1_lock(hit: _Hit, cut: float) -> bool:
+    """Lock only a high cosine that is also supported by at least 5 peaks."""
+    return float(hit.spec) >= float(cut) and float(hit.n_match) >= float(CLASS1_LOCK_MIN_PEAKS)
 
 
 def _linear_score(hit: _Hit, cfg: Config) -> float:
-    """Equal-footing merge score: 0.42 spec + 0.46 Tanimoto + 0.12 mass."""
-    w_s = float(cfg.w_spectral)
-    w_f = float(cfg.w_fingerprint)
-    w_m = float(cfg.w_mass)
-    w = w_s + w_f + w_m
-    if w <= 0:
-        w = 1.0
-    return float((w_s * hit.spec + w_f * hit.tani + w_m * hit.mass) / w)
+    """Compete score for unlocked candidates.
+
+    Verified spectral matches (spec > 0 and at least 4 peaks) keep
+    ``0.42 * spec + 0.46 * tanimoto + 0.12 * mass``. Class 2 and analogs have
+    no spectrum, so they are scored on fingerprint and mass only. A 0.92 prior
+    keeps a real spectral match ahead of an equal database hit, while a
+    high-Tanimoto natural product still beats a noisy few-peak train decoy.
+    """
+    verified = float(hit.spec) > 0.0 and float(hit.n_match) >= float(MIN_MATCHED_PEAKS)
+    if verified:
+        w_s = float(cfg.w_spectral)
+        w_f = float(cfg.w_fingerprint)
+        w_m = float(cfg.w_mass)
+        w = w_s + w_f + w_m
+        if w <= 0:
+            w = 1.0
+        return float((w_s * hit.spec + w_f * hit.tani + w_m * hit.mass) / w)
+    w = CLASS2_FP_WEIGHT + CLASS2_MASS_WEIGHT
+    score = (CLASS2_FP_WEIGHT * float(hit.tani) + CLASS2_MASS_WEIGHT * float(hit.mass)) / w
+    return float(score * CLASS2_PRIOR)
 
 
 def _with_linear_score(hit: _Hit, cfg: Config) -> _Hit:
@@ -760,17 +806,17 @@ def _merge_tiers(
     *,
     lock_cut: float | None = None,
 ) -> list[_Hit]:
-    """Lock cosine>=0.75 Class 1; compete weak Class 1, Class 2, and analogs by score."""
+    """Lock cosine>=0.75 and >=5 peaks; compete the rest, including Class 2."""
     cut = float(lock_cut if lock_cut is not None else getattr(cfg, "soft_merge_lock_cosine", CLASS1_LOCK_COSINE) or CLASS1_LOCK_COSINE)
     top_k = int(cfg.top_k)
-    locked = [h for h in class1 if h.spec >= cut]
+    locked = [h for h in class1 if _is_class1_lock(h, cut)]
     locked.sort(key=lambda h: (-h.spec, -h.score))
     locked = locked[:top_k]
-    locked_keys = {h.inchikey14 for h in locked}
+    locked_keys = {_skeleton_key(h) for h in locked}
     remain = max(top_k - len(locked), 0)
-    weak_c1 = [_with_linear_score(h, cfg) for h in class1 if h.inchikey14 not in locked_keys]
-    valid_c2 = [_with_linear_score(h, cfg) for h in class2 if h.inchikey14 not in locked_keys]
-    analog_scored = [_with_linear_score(h, cfg) for h in analog_hits if h.inchikey14 not in locked_keys]
+    weak_c1 = [_with_linear_score(h, cfg) for h in class1 if _skeleton_key(h) not in locked_keys]
+    valid_c2 = [_with_linear_score(h, cfg) for h in class2 if _skeleton_key(h) not in locked_keys]
+    analog_scored = [_with_linear_score(h, cfg) for h in analog_hits if _skeleton_key(h) not in locked_keys]
     competed = _merge_hits(weak_c1, valid_c2, analog_scored, top_k=remain)
     return (locked + competed)[:top_k]
 
@@ -787,7 +833,7 @@ def rank_molecules(
     reranker=None,
     formula_model=None,
 ) -> dict[str, list[str]]:
-    """Lock cosine>=0.75 Class 1; compete weak train, Class 2, and mass-shifted analogs."""
+    """Lock cosine>=0.75 with >=5 peaks; compete weak train, Class 2, and analogs."""
     from src.analogs import expand_smiles
 
     lock_cut = float(getattr(cfg, "soft_merge_lock_cosine", CLASS1_LOCK_COSINE) or CLASS1_LOCK_COSINE)
@@ -806,12 +852,12 @@ def rank_molecules(
         groups = feat.get("group_features") or [feat]
         qmass = float(feat.get("neutral_mass") or 0.0)
         class1 = _rank_one(feat, groups, pred_fps[mid], index, cfg)
-        locked = [h for h in class1 if h.spec >= lock_cut]
+        locked = [h for h in class1 if _is_class1_lock(h, lock_cut)]
         locked.sort(key=lambda h: (-h.spec, -h.score))
         locked = locked[: int(cfg.top_k)]
         if locked:
             n_mol_locked += 1
-        locked_keys = {h.inchikey14 for h in locked}
+        locked_keys = {_skeleton_key(h) for h in locked}
         class2: list[_Hit] = []
         analog_hits: list[_Hit] = []
         if external_index is not None:
@@ -833,7 +879,7 @@ def rank_molecules(
             raw_c2 = _rank_fingerprint_only(feat, groups, pred_fps[mid], external_index, cfg)
             if not raw_c2:
                 n_c2_empty += 1
-            class2 = [h for h in raw_c2 if h.inchikey14 not in locked_keys]
+            class2 = [h for h in raw_c2 if _skeleton_key(h) not in locked_keys]
             if class2:
                 n_c2 += 1
                 n_c2_hits += len(class2)
@@ -849,15 +895,16 @@ def rank_molecules(
                     for h in _rank_mass_shifted_analogs(
                         feat, groups, pred_fps[mid], external_index, cfg
                     )
-                    if h.inchikey14 not in locked_keys
+                    if _skeleton_key(h) not in locked_keys
                 ]
                 if analog_hits:
                     n_shift += 1
-        analog_keys = {h.inchikey14 for h in analog_hits}
+        analog_keys = {_skeleton_key(h) for h in analog_hits}
+        c2_keys = {_skeleton_key(h) for h in class2}
         merged = _merge_tiers(class1, class2, analog_hits, cfg, lock_cut=lock_cut)
-        shifted = [h for h in merged if h.inchikey14 in analog_keys]
+        shifted = [h for h in merged if _skeleton_key(h) in analog_keys]
         n_analog_placed += len(shifted)
-        n_c2_placed += sum(1 for h in merged if h.inchikey14 in {x.inchikey14 for x in class2})
+        n_c2_placed += sum(1 for h in merged if _skeleton_key(h) in c2_keys)
         smiles = _hits_to_smiles(merged)[: cfg.top_k]
         if len(smiles) < cfg.top_k:
             analog_smi = expand_smiles(
@@ -887,7 +934,10 @@ def rank_molecules(
                 f"[rank] {i+1}/{n} last_n={len(out[mid])} locked={len(locked)} "
                 f"class2_hits={len(class2)} shifted={len(shifted)}"
             )
-    print(f"[rank] molecules with locked Class 1 (cosine>={lock_cut}): {n_mol_locked}/{n}")
+    print(
+        f"[rank] molecules with locked Class 1 "
+        f"(cosine>={lock_cut}, n_match>={CLASS1_LOCK_MIN_PEAKS}): {n_mol_locked}/{n}"
+    )
     if external_index is not None:
         print(
             f"[rank] molecules with Class 2 mass hits: {n_c2}/{n} "

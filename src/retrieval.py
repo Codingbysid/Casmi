@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,6 +11,29 @@ import numpy as np
 from src.chem import precursor_to_neutral_mass
 from src.config import Config
 from src.preprocessing import bin_spectrum
+
+# One or two shared low-mass fragments (water, CO2) can otherwise produce
+# cosine >= 0.75 and lock a train decoy. Require real peak support first.
+MIN_MATCHED_PEAKS = 4
+MIN_QUERY_INTENSITY_FRACTION = 0.15
+COVERAGE_REFERENCE_PEAKS = 8.0
+
+
+def gated_modified_cosine(
+    raw_cosine: float,
+    n_hits: int,
+    intensity_fraction: float,
+    *,
+    min_matched_peaks: int = MIN_MATCHED_PEAKS,
+    min_intensity_fraction: float = MIN_QUERY_INTENSITY_FRACTION,
+) -> float:
+    """Zero unsupported matches, then damp cosine by peak coverage."""
+    if int(n_hits) < int(min_matched_peaks):
+        return 0.0
+    if float(intensity_fraction) < float(min_intensity_fraction):
+        return 0.0
+    coverage_weight = min(1.0, math.sqrt(float(n_hits) / COVERAGE_REFERENCE_PEAKS))
+    return float(raw_cosine) * coverage_weight
 
 
 @dataclass
@@ -272,19 +296,37 @@ def modified_cosine(
     tol: float,
     *,
     return_n_match: bool = False,
-) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
-    """GNPS-style modified cosine: match fragments *or* precursor-shifted fragments."""
+    return_intensity_fraction: bool = False,
+    min_matched_peaks: int = MIN_MATCHED_PEAKS,
+    min_intensity_fraction: float = MIN_QUERY_INTENSITY_FRACTION,
+) -> np.ndarray | tuple[np.ndarray, ...]:
+    """GNPS-style modified cosine: match fragments *or* precursor-shifted fragments.
+
+    Scores with fewer than ``min_matched_peaks`` hits, or whose matched peaks
+    cover less than ``min_intensity_fraction`` of the query intensity, are 0.
+    Supported matches are scaled by ``sqrt(n_hits / 8)`` until eight peaks match.
+    """
     q_m = query_mask > 0
     q_mz = query_mz[q_m]
     q_i = query_int[q_m]
     n = cand_mz.shape[0]
     scores = np.zeros(n, dtype=np.float32)
     n_match = np.zeros(n, dtype=np.float32)
+    intensity_frac = np.zeros(n, dtype=np.float32)
+
+    def _pack():
+        if return_n_match and return_intensity_fraction:
+            return scores, n_match, intensity_frac
+        if return_n_match:
+            return scores, n_match
+        return scores
+
     if q_mz.size == 0:
-        return (scores, n_match) if return_n_match else scores
+        return _pack()
     q_norm = float(np.sqrt(np.dot(q_i, q_i)))
-    if q_norm <= 0:
-        return (scores, n_match) if return_n_match else scores
+    q_total = float(np.sum(q_i))
+    if q_norm <= 0 or q_total <= 0:
+        return _pack()
     for i in range(n):
         c_m = cand_mask[i] > 0
         c_mz = cand_mz[i, c_m]
@@ -308,6 +350,7 @@ def modified_cosine(
         flat = prod.ravel()
         order = np.argsort(flat)[::-1]
         n_hits = 0
+        matched_query_intensity = 0.0
         for idx in order:
             val = float(flat[idx])
             if val <= 0:
@@ -320,11 +363,19 @@ def modified_cosine(
             used_q[qi] = True
             dot += val
             n_hits += 1
-        scores[i] = float(dot / (q_norm * c_norm))
+            matched_query_intensity += float(q_i[qi])
+        raw = float(dot / (q_norm * c_norm))
+        frac = matched_query_intensity / q_total
+        scores[i] = gated_modified_cosine(
+            raw,
+            n_hits,
+            frac,
+            min_matched_peaks=min_matched_peaks,
+            min_intensity_fraction=min_intensity_fraction,
+        )
         n_match[i] = float(n_hits)
-    if return_n_match:
-        return scores, n_match
-    return scores
+        intensity_frac[i] = float(frac)
+    return _pack()
 
 
 def tanimoto(query_fp: np.ndarray, cand_fp: np.ndarray) -> np.ndarray:
