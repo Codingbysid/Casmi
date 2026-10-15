@@ -57,6 +57,9 @@ class StructureIndex:
     peak_nl: np.ndarray | None = None  # (N, top_n)
     precursor_feat: np.ndarray | None = None  # (N, precursor_feat_dim)
     adduct_id: np.ndarray | None = None  # (N,)
+    # Observed representative precursor m/z. NaN when the spectrum did not
+    # report one. Never filled from the molecular formula.
+    precursor_mz: np.ndarray | None = None  # (N,) float64
 
     @classmethod
     def build(
@@ -74,6 +77,7 @@ class StructureIndex:
         peak_nl: np.ndarray | None = None,
         precursor_feat: np.ndarray | None = None,
         adduct_id: np.ndarray | None = None,
+        precursor_mz: np.ndarray | None = None,
     ) -> "StructureIndex":
         mass = np.asarray(exact_mass, dtype=np.float64)
         order = np.argsort(mass, kind="mergesort")
@@ -100,6 +104,7 @@ class StructureIndex:
             if precursor_feat is None
             else np.asarray(precursor_feat, dtype=np.float32),
             adduct_id=None if adduct_id is None else np.asarray(adduct_id, dtype=np.int64),
+            precursor_mz=None if precursor_mz is None else np.asarray(precursor_mz, dtype=np.float64),
         )
 
     def mass_window(

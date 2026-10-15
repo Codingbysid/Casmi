@@ -108,9 +108,13 @@ class Config:
     use_neighbor_fp: bool = True
     use_mass_shift: bool = True
     ensemble_seeds: int = 3
-    # Learned reranker (experiment): rescore only the top-N unlocked candidates
-    # by the 0.150 compete score; the tail keeps its baseline order.
+    # Learned reranker: rescore only the top-N unlocked candidates by the
+    # 0.150 compete score; the tail keeps its baseline order.
     rerank_window: int = 200
+    # Separate experiment ``precursor-mz-shift-v1``. Off for the required-reranker
+    # run: modified cosine then still receives neutral exact mass as cand_prec.
+    # On: use the stored observed precursor m/z and never invent one.
+    use_observed_precursor: bool = False
 
     # Model
     d_model: int = 256

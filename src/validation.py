@@ -172,8 +172,14 @@ def checkpoint_is_complete(
     fit_hash: str,
     config_hash: str,
     seed: int | None = None,
+    source_hash: str | None = None,
+    versions: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
-    """Only a checkpoint from a finished run on the same fit subset may be reused."""
+    """Only a checkpoint from a finished run on the same fit subset may be reused.
+
+    ``source_hash`` and ``versions`` are optional so older callers keep working.
+    The production pipeline always passes both.
+    """
     if not extra:
         return False, "no extra metadata"
     if str(extra.get("stop_reason")) != "epochs_complete":
@@ -186,6 +192,13 @@ def checkpoint_is_complete(
         return False, "model config hash mismatch"
     if seed is not None and int(extra.get("seed", -1)) != int(seed):
         return False, f"seed={extra.get('seed')} != {seed}"
+    if source_hash is not None and str(extra.get("source_hash", "")) != str(source_hash):
+        return False, "source hash mismatch"
+    if versions is not None:
+        got = extra.get("versions") or {}
+        for key, value in versions.items():
+            if str(got.get(key)) != str(value):
+                return False, f"version mismatch {key}: {got.get(key)!r} != {value!r}"
     return True, "complete"
 
 
@@ -658,6 +671,7 @@ def masked_library(index: StructureIndex, drop_rows: set[int]) -> StructureIndex
         peak_nl=_take(index.peak_nl),
         precursor_feat=_take(index.precursor_feat),
         adduct_id=_take(index.adduct_id),
+        precursor_mz=_take(index.precursor_mz),
     )
     print(f"[library] masked copy n={len(out.smiles)} (dropped {n - len(out.smiles)} rows)")
     return out

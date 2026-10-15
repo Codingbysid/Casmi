@@ -158,6 +158,7 @@ def build_library_from_train(
     peak_nl = np.zeros((len(keys), cfg.top_n_peaks), dtype=np.float32)
     precursor_feat = np.full((len(keys), cfg.precursor_feat_dim), np.nan, dtype=np.float32)
     adduct_id = np.full(len(keys), -1, dtype=np.int64)
+    precursor_mz = np.full(len(keys), np.nan, dtype=np.float64)
     for i, k in enumerate(keys):
         feat = best_feat.get(k)
         if feat is None:
@@ -168,6 +169,9 @@ def build_library_from_train(
         peak_nl[i] = feat["peak_nl"]
         precursor_feat[i] = feat["precursor_feat"]
         adduct_id[i] = feat["adduct_id"]
+        observed = feat.get("precursor_mz")
+        if observed is not None and np.isfinite(float(observed)) and float(observed) > 0:
+            precursor_mz[i] = float(observed)
 
     ion_mode = np.array(
         [str((best_feat.get(k) or {}).get("ionization_mode") or "") for k in keys],
@@ -186,6 +190,7 @@ def build_library_from_train(
         peak_nl=peak_nl,
         precursor_feat=precursor_feat,
         adduct_id=adduct_id,
+        precursor_mz=precursor_mz,
     )
 
 
@@ -233,6 +238,16 @@ def build_library_from_frame(df: pd.DataFrame, cfg: Config) -> StructureIndex:
     peak_nl = np.stack([best_feat[k]["peak_nl"] for k in keys])
     precursor_feat = np.stack([best_feat[k]["precursor_feat"] for k in keys])
     adduct_id = np.asarray([best_feat[k]["adduct_id"] for k in keys], dtype=np.int64)
+    precursor_mz = np.array(
+        [
+            float(best_feat[k]["precursor_mz"])
+            if np.isfinite(float(best_feat[k].get("precursor_mz") or np.nan))
+            and float(best_feat[k].get("precursor_mz") or 0.0) > 0
+            else np.nan
+            for k in keys
+        ],
+        dtype=np.float64,
+    )
     ion_mode = np.array(
         [str(best_feat[k].get("ionization_mode") or "") for k in keys],
         dtype=object,
@@ -250,6 +265,7 @@ def build_library_from_frame(df: pd.DataFrame, cfg: Config) -> StructureIndex:
         peak_nl=peak_nl,
         precursor_feat=precursor_feat,
         adduct_id=adduct_id,
+        precursor_mz=precursor_mz,
     )
 
 
@@ -307,6 +323,8 @@ def predict_fingerprint_ensemble(
     features: list[dict[str, Any]],
     cfg: Config,
     device=None,
+    *,
+    allow_uniform: bool = True,
 ) -> np.ndarray:
     """Average pre-sigmoid logits across trained seeds, then sigmoid."""
     if models is None:
@@ -324,6 +342,10 @@ def predict_fingerprint_ensemble(
         acc = logits if acc is None else acc + logits
         n_ok += 1
     if acc is None or n_ok == 0:
+        if not allow_uniform:
+            raise RuntimeError(
+                "refusing uniform fingerprint predictions; every production seed must be a trained model"
+            )
         return predict_fingerprints(None, features, cfg)
     mean = acc / float(n_ok)
     print(f"[ensemble] models={n_ok} averaged pre-sigmoid logits")
@@ -460,6 +482,24 @@ def _score_candidates(
         spec_pick = np.zeros(pick.size, dtype=np.float32)
         match_pick = np.zeros(pick.size, dtype=np.float32)
         frac_pick = np.zeros(pick.size, dtype=np.float32)
+        # Historical path passes neutral exact mass. ``precursor-mz-shift-v1``
+        # passes the observed precursor and will not invent a missing value.
+        if bool(getattr(cfg, "use_observed_precursor", False)):
+            stored = getattr(index, "precursor_mz", None)
+            if stored is None:
+                raise RuntimeError(
+                    "precursor-mz-shift-v1 requires index.precursor_mz; "
+                    "refusing to invent precursors from formulae or neutral mass"
+                )
+            cand_prec = np.asarray(stored, dtype=np.float64)[cand_idx[pick]]
+            if not np.isfinite(cand_prec).all():
+                raise RuntimeError(
+                    "observed precursor_mz is missing for a spectral candidate; "
+                    "refusing to invent it"
+                )
+            cand_prec = cand_prec.astype(np.float32)
+        else:
+            cand_prec = cand_mass[pick].astype(np.float32)
         for g in groups:
             s, m, frac = modified_cosine(
                 g["peak_mz"],
@@ -469,7 +509,7 @@ def _score_candidates(
                 index.peak_mz[cand_idx[pick]],
                 index.peak_intensity[cand_idx[pick]],
                 index.peak_mask[cand_idx[pick]],
-                cand_mass[pick].astype(np.float32),
+                cand_prec,
                 cfg.modified_cosine_mz_tol,
                 return_n_match=True,
                 return_intensity_fraction=True,
@@ -1240,7 +1280,12 @@ def _rank_query(
     return smiles, stats, trace
 
 
-def featurize_test_molecules(test_df: pd.DataFrame, cfg: Config) -> dict[str, dict[str, Any]]:
+def featurize_test_molecules(
+    test_df: pd.DataFrame,
+    cfg: Config,
+    *,
+    strict: bool = False,
+) -> dict[str, dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for rec in test_df.to_dict(orient="records"):
         grouped[str(rec["molecule_id"])].append(rec)
@@ -1250,6 +1295,8 @@ def featurize_test_molecules(test_df: pd.DataFrame, cfg: Config) -> dict[str, di
         try:
             feats[mid] = featurize_aggregated(rows, cfg=cfg)
         except Exception as exc:
+            if strict:
+                raise RuntimeError(f"featurize failed for {mid}") from exc
             n_fail += 1
             row = rows[0]
             feats[mid] = featurize_spectrum(
@@ -1294,6 +1341,12 @@ def predict_test(
     reranker=None,
     formula_model=None,
     trace_out: dict[str, dict[str, Any]] | None = None,
+    allow_decoder: bool = False,
+    strict: bool = False,
+    require_reranker: bool = False,
+    require_neighbors: bool = False,
+    allow_uniform: bool = True,
+    neighbor_index=None,
 ) -> pd.DataFrame:
     cfg = cfg or get_config()
     if test_df is None:
@@ -1305,37 +1358,53 @@ def predict_test(
         model = load_model(cfg.checkpoint_path, cfg)
     if not ensemble and model is not None:
         ensemble = [model]
-    if decoder is None and cfg.smiles_checkpoint_path.exists():
+    if allow_decoder and decoder is None and cfg.smiles_checkpoint_path.exists():
         from src.smiles_train import load_decoder
 
         decoder, tokenizer = load_decoder(cfg.smiles_checkpoint_path, cfg, map_location="cpu")
+    elif not allow_decoder:
+        decoder, tokenizer = None, None
+    if require_reranker and reranker is None:
+        raise RuntimeError("required reranker is missing; refusing to rank with the linear score")
     if external_index is None:
         external_index = load_external_structure_index(None, cfg)
     if external_index is None:
+        if strict:
+            raise RuntimeError("Class 2 library is missing; refusing to rank Class 1 only")
         print("[class2] no LOTUS/COCONUT table attached — ranking Class 1 only")
-    # The formula head stays off. The learned reranker is used when the caller
-    # passes one (the notebook does so only after the promotion rule passes).
     formula_model = None
     print(f"[predict] reranker={'active' if reranker is not None else 'none'}")
 
-    mol_feats = featurize_test_molecules(test_df, cfg)
+    mol_feats = featurize_test_molecules(test_df, cfg, strict=strict)
     mids = list(mol_feats.keys())
     feat_list = [mol_feats[m] for m in mids]
-    fps = predict_fingerprint_ensemble(ensemble, feat_list, cfg)
-    if bool(getattr(cfg, "use_neighbor_fp", True)) and getattr(index, "peak_mz", None) is not None:
-        try:
-            from src.neighbors import SpectralNeighborIndex, blend_predicted_fingerprints
+    fps = predict_fingerprint_ensemble(ensemble, feat_list, cfg, allow_uniform=allow_uniform)
+    if neighbor_index is not None or require_neighbors or (
+        bool(getattr(cfg, "use_neighbor_fp", True)) and getattr(index, "peak_mz", None) is not None
+    ):
+        from src.neighbors import SpectralNeighborIndex, blend_predicted_fingerprints
 
-            nbr = SpectralNeighborIndex.from_structure_index(index, cfg)
-            fps = blend_predicted_fingerprints(
+        def _blend(nbr):
+            blended = blend_predicted_fingerprints(
                 fps,
                 feat_list,
                 nbr,
                 k=int(getattr(cfg, "neighbor_k", 20)),
                 alpha=float(getattr(cfg, "neighbor_blend", 0.5)),
             )
-        except Exception as exc:
-            print(f"[neighbor] skipped: {exc}")
+            if blended.shape != fps.shape or not np.isfinite(blended).all():
+                raise RuntimeError("neighbor blend returned a bad fingerprint array")
+            return blended
+
+        if neighbor_index is not None:
+            fps = _blend(neighbor_index)
+        elif require_neighbors:
+            fps = _blend(SpectralNeighborIndex.from_structure_index(index, cfg))
+        else:
+            try:
+                fps = _blend(SpectralNeighborIndex.from_structure_index(index, cfg))
+            except Exception as exc:
+                print(f"[neighbor] skipped: {exc}")
     pred_map = {m: fps[i] for i, m in enumerate(mids)}
     ranked = rank_molecules(
         mol_feats,
@@ -1365,6 +1434,8 @@ def predict_test(
                 top_k=cfg.top_k,
             )
         if not guesses:
+            if strict:
+                raise RuntimeError(f"no SMILES for {mid} after ranking and legitimate padding")
             n_empty += 1
             guesses = [FALLBACK_SMILES]
         filled[mid] = guesses

@@ -465,8 +465,11 @@ class NotebookSyncTests(unittest.TestCase):
             for cell in code:
                 ast.parse(cell)
             joined = "\n".join(code)
+            # The embedded src dump includes atomic partial-file cleanup. The
+            # notebook's own cells must not delete unrelated files.
+            own = "\n".join(cell for cell in code if "FILES = json.loads" not in cell)
             for bad in ("rmtree", ".unlink(", "os.remove("):
-                self.assertNotIn(bad, joined, f"destructive cleanup {bad} in {name}")
+                self.assertNotIn(bad, own, f"destructive cleanup {bad} in {name}")
             self.assertIn("REQUIRE_CUDA", joined)
             self.assertIn("HistGradientBoostingClassifier", joined)
             self.assertIn("PROMOTION_RULE", joined)

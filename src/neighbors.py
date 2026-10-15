@@ -134,7 +134,9 @@ class SpectralNeighborIndex:
             k=k,
         )
         if nfp.size != np.asarray(spec2fp).size:
-            return np.asarray(spec2fp, dtype=np.float32)
+            raise ValueError(
+                f"neighbor fingerprint width {nfp.size} != model fingerprint {np.asarray(spec2fp).size}"
+            )
         return blend_fingerprints(spec2fp, nfp, alpha=alpha)
 
 

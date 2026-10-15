@@ -345,6 +345,35 @@ def inchikey14_from_smiles(smiles: str | None) -> str:
     return ""
 
 
+def official_metric_inchikey14(smiles: str | None) -> str:
+    """Identity from Kaggle metric version 14. Not used by required-reranker-v1.
+
+    Experiment ``official-inchikey14-v14``. The published scorer pins RDKit
+    2026.03.3 and does MolFromSmiles, RemoveStereochemistry, the default
+    TautomerEnumerator.Canonicalize, then MolToInchiKey[:14]. Invalid SMILES
+    yields "". Production dedup still uses ``inchikey14_from_smiles``, whose
+    enumerator has SetMaxTransforms(1000) and does not strip stereochemistry
+    first. Do not switch ranking onto this function in the first scored run.
+    """
+    if not _HAS_RDKIT or not smiles or Chem is None:
+        return ""
+    mol = Chem.MolFromSmiles(str(smiles))
+    if mol is None:
+        return ""
+    try:
+        Chem.RemoveStereochemistry(mol)
+    except Exception:
+        return ""
+    try:
+        from rdkit.Chem.MolStandardize import rdMolStandardize
+
+        enumerator = rdMolStandardize.TautomerEnumerator()
+        canon = enumerator.Canonicalize(mol)
+    except Exception:
+        canon = None
+    return _inchikey14_from_mol(canon if canon is not None else mol)
+
+
 @lru_cache(maxsize=500_000)
 def heavy_atom_graph_key(smiles: str | None) -> str:
     """Canonical SMILES of the element-labelled heavy-atom graph (all bonds single).

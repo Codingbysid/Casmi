@@ -1,7 +1,9 @@
 # Enveda CASMI 2026 — model brief
 
 This file is the source of truth for the current pipeline. Read it before proposing changes.
-The Kaggle notebook is generated from `src/` by `scripts/make_kaggle_notebook.py`. Edit `src/` and the generator, then regenerate `kaggle_submission.ipynb` and `kaggle_gpu_submission.ipynb` (same content). Do not hand-edit the notebooks. `tests/test_reranker_experiment.py` fails when the embedded `src/` no longer matches the working tree.
+Notebooks are generated from `src/` by `scripts/make_kaggle_notebook.py`. Edit `src/` and the generator, then regenerate. Do not hand-edit the notebooks. `tests/test_reranker_experiment.py` fails when the embedded `src/` no longer matches the working tree.
+
+The next upload is the required-reranker train-and-predict notebook (`kaggle_submission.ipynb`, `kaggle_gpu_submission.ipynb`, and `kaggle_submission_tpu.ipynb` are the same notebook). `kaggle_predict_only.ipynb` loads a finished bundle and does not train. A notebook uploaded before this change still contains the promotion gate and is not this run.
 
 ## Task
 
@@ -9,7 +11,9 @@ Kaggle: **Enveda CASMI 2026 — Molecule ID from Mass Spectra**.
 
 For each unknown molecule, rank up to **25 SMILES**. The metric is **MRR@25** on the first 14 characters of the RDKit InChIKey (InChIKey14, the connectivity skeleton). Stereochemistry and the second InChIKey block do not count. Exactly one row per `molecule_id`. Guesses are semicolon-separated SMILES. Empty rows are invalid.
 
-RDKit versions matter for the key. Our dedup key is `TautomerEnumerator.Canonicalize` → InChIKey block 1 (`inchikey14_from_smiles`). The evaluation page reportedly scores with RDKit 2026.03.3 (the page is JS-rendered and could not be re-read offline); the notebook installs the 2025.09.5 wheel; the laptop has 2026.03.6. Measured on the Class 2 pool: 10% of raw `inchikey14` values change under tautomer canonicalization, canonicalization costs ~43 ms per SMILES versus ~0.4 ms for the heavy-atom graph key (`heavy_atom_graph_key`, a verified necessary condition for canonical-key equality: 0 mismatches over 487 tautomer-changed structures). Production dedup canonicalizes only when two candidates share a graph key; the output is identical to canonicalizing everything.
+RDKit versions matter for the key. Production dedup is `inchikey14_from_smiles`: the module `TautomerEnumerator` with `SetMaxTransforms(1000)`, then InChIKey block 1. It does not call `RemoveStereochemistry` first. The Kaggle metric page (version 14, RDKit 2026.03.3) is a different sequence, implemented as `official_metric_inchikey14` and left unused. See experiment `official-inchikey14-v14` below. The notebook installs the 2025.09.5 wheel; this laptop has 2026.03.6. Do not upgrade the training environment to chase the scorer pin.
+
+Measured earlier on the Class 2 pool: 10% of raw `inchikey14` values change under the production tautomer canonicalization. Canonicalization costs ~43 ms per SMILES versus ~0.4 ms for the heavy-atom graph key (`heavy_atom_graph_key`, a verified necessary condition for canonical-key equality: 0 mismatches over 487 tautomer-changed structures). Production dedup canonicalizes only when two candidates share a graph key; the output is identical to canonicalizing everything.
 
 Approximate hidden-test mix (organizer estimate, not a label we have):
 
@@ -63,16 +67,16 @@ The 0.150 run bundled **four** ranking changes (peak-support gate, five-peak loc
 
 1. Install RDKit from the attached wheel. Fail if `from rdkit import Chem` does not work.
 2. Build a train **StructureIndex**: one representative MS2 per InChIKey14 (the row with the most peaks), exact mass from formula, Morgan fingerprint, top-128 peaks.
-3. Train **3 Spec2FP seeds** (42, 7, 123) on the fixed 120k fitting subset (`fitting_subset_indices`, seed 42). Average **pre-sigmoid logits**, then sigmoid. Every seed must reach `completed_epochs == 4`; a time limit now raises instead of ranking with a partial ensemble. Checkpoints record `fit_subset_hash`, `model_config_hash`, `seed`, `completed_epochs`, `stop_reason`, and an attached previous run is reused only when all of them match.
+3. Train **3 Spec2FP seeds** (42, 7, 123) on the fixed 120k fitting subset (`fitting_subset_indices`, seed 42). Average **pre-sigmoid logits**, then sigmoid. Last epoch is kept (`restore_best_checkpoint` is false). Every seed must reach `completed_epochs == 4`; a time limit raises instead of ranking with a partial ensemble. Each finished seed is written atomically under `/kaggle/working/casmi_run/checkpoints/` and the manifest is updated immediately. A checkpoint is reused only when the fit-subset identity hash, model/training config hash, source/preprocessing hash, dependency versions, seed, and four completed epochs all match.
 4. Blend the predicted fingerprint with a spectral-neighbor fingerprint: binned-spectrum cosine kNN, **k=20**, against train spectra, **alpha=0.5** (`src/neighbors.py`).
 5. `rank_molecules` in `src/infer.py`:
    - **Tier 1 lock.** Class 1 hits stay at the top only when modified cosine is **≥ 0.75** and at least **5** peaks matched. Matches with fewer than 4 peaks, or under 15% of query intensity, have cosine 0.
    - **Tier 2 compete.** Verified spectral hits use `0.42 * spec + 0.46 * tanimoto + 0.12 * mass`. Class 2 and analogs have no spectrum, so they use `0.92 * (0.78 * tanimoto + 0.22 * mass)`. One slot per tautomer-canonical skeleton (`_emit_unique`, graph-key-gated canonicalization, output-equivalent to the reference `_merge_hits`).
-   - **Experiment arm (pending, see below).** When a fitted reranker is passed, only the top `rerank_window=200` unlocked candidates (by the compete score) are reordered by the learned score; the tail keeps the compete order and locked hits never move. With `reranker=None` the output is the 0.150 ordering.
+   - **Required reranker.** The scored notebook always fits the current 22-feature `HistGradientBoostingClassifier` and passes it in. Only the top `rerank_window=200` unlocked candidates are reordered; the tail keeps the compete order and the locked prefix never moves. A missing, incompatible, or non-finite reranker raises. The linear 0.150 order is not a fallback.
    - **Tier 3 pad** to 25 with SMARTS expansion, then nearest library SMILES. The SMILES decoder is **off** (`TRAIN_DECODER = False`). It emits garbage and is not used.
 6. Write `/kaggle/working/submission.csv` with columns `molecule_id`, `smiles`.
 
-Modified cosine is GNPS-style: a peak matches if it is within 0.05 Da **or** matches after the precursor-mass shift (`src/retrieval.py`).
+Modified cosine is GNPS-style: a peak matches if it is within 0.05 Da **or** matches after `query precursor_mz − candidate precursor` (`src/retrieval.py`). The scored run still passes the candidate's neutral exact mass as that candidate precursor. Observed precursor m/z is stored on the index and is used only by the separate opt-in experiment `precursor-mz-shift-v1`.
 
 Class 2 lookup is `np.searchsorted` on sorted `exact_mass` inside ±15 ppm / 0.02 Da at query time. Do not prefilter the parquet.
 
@@ -96,38 +100,45 @@ A CLS token over the peak transformer, the binned vector, and the precursor/addu
 - `batch_size=64`
 - `MAX_TRAIN_SPECTRA=120_000` unique library rows (`fitting_subset_indices(n, 120_000, seed=42)`, the same RNG call the 0.139/0.150 runs made)
 - `NUM_EPOCHS=4`
-- 3 seeds, each capped at **1.5 h**; a timeout is a hard failure, not a quiet fallback. On a Kaggle GPU a seed takes roughly 15–25 min.
+- 3 seeds, each capped at **1.5 h**; a timeout is a hard failure, not a quiet fallback. This workflow has not been timed on a Kaggle GPU.
 
-Config defaults in `src/config.py` (`d_model=256`, 8 epochs, 400k spectra) are **not** what Kaggle runs. The notebook cell is.
+Config defaults in `src/config.py` (`d_model=256`, 8 epochs, 400k spectra, `restore_best_checkpoint=True`) are **not** what Kaggle runs. The scored run uses `RECIPE` in `src/pipeline.py`.
 
-## Current notebook knobs (`scripts/make_kaggle_notebook.py`)
+## Execution path
 
-```
-REQUIRE_CLASS2 = True
-REQUIRE_CUDA = True          # GPU session required unless FAST_DEV_RUN
-FAST_DEV_RUN = False
-PREFER_XLA = False           # no TPU
-TRAIN_DECODER = False
-ENSEMBLE_SEEDS = 3
-MAX_TRAIN_SPECTRA = 120_000
-NUM_EPOCHS = 4
-BATCH_SIZE = 64
-TRAIN_TIME_LIMIT_S = 1.5h    # per seed
-USE_NEIGHBOR_FP = True
-NEIGHBOR_BLEND = 0.5
-SESSION_BUDGET_S = 8.5h
-RANK_RESERVE_S = 1h          # kept free for production ranking + artifacts
+`src/pipeline.py` is the only path the notebooks call. The frozen recipe is `RECIPE` in that module. The notebook does not shrink epochs, the ensemble, or the 120k fitting subset to fit a timeout.
 
-RERANKER_EXPERIMENT = True   # False = skip validation, ship the exact 0.150 ordering
-RERANK_WINDOW = 200
-REUSE_CHECKPOINTS = True     # only after fit-subset / config / seed / epoch checks
-RANK_WORKERS = 4             # fork workers for validation candidate generation
-VALIDATION_SEED = 0
-N_RR_TRAIN, N_DEV, N_AUDIT, N_PANEL = 1200, 400, 800, 400
-VALIDATION_BUDGET_S = 3h
-```
+Train-and-predict (`run_train_and_predict`):
 
-Kaggle constraints: **GPU session (P100/T4), internet off**, kernel source **< 1 MB** (the notebook embeds `src/` as JSON; Class 2 is an attached dataset, never embedded), Python 3.12, Run All must finish inside **9 h** and write `submission.csv`. The run leaves `/kaggle/working/casmi_run/` in place (checkpoints, `reranker.pkl`, `run_manifest.json`, `splits.json`, `validation_results.json`, `candidate_traces.parquet`, `diagnostics/`, `casmi_diagnostics.zip`); nothing is deleted at the end, and `submission.csv` is the only CSV at the working root.
+1. Preflight. Move an existing `submission.csv` to `submission_previous_<utc>.csv`. Bound OpenMP/MKL/OpenBLAS/NumExpr and Torch threads to 4. Require CUDA, sklearn `HistGradientBoostingClassifier`, and a Class 2 parquet with exactly 452,608 rows.
+2. Build or load the spectral library and the neighbor bins. Caches are `library.npz` / `neighbor.npz` plus JSON sidecars (`casmi-spectral-library-v1`, `casmi-neighbor-bins-v1`). A cache is used only when schema, shapes, row-order hash, and input provenance match. The library cache is keyed by the train parquet content hash and the checkpoint source hash, not by `test.parquet`.
+3. Train or reuse seeds 42, 7, and 123. Save after each completed seed. An incomplete checkpoint raises.
+4. Build only the existing `RR_TRAIN` partition (1200 skeletons, validation seed 0) and its U and K regimes. Alias-in-fit rows stay excluded. Rank those queries in one process (`workers=1`). Do not rank DEV, AUDIT, or PANEL. Do not bootstrap, permute, or decide a promotion.
+5. Fit the required reranker. A status other than `fitted` raises. There is no second estimator and no linear-score substitute.
+6. Predict the test set with neighbor blending required, decoder off, and uniform fingerprint predictions forbidden. Print `STRATEGY_ACTIVE` before prediction.
+7. Check the partial CSV, then `os.replace` it to `submission.csv`. Print `SUBMISSION_READY` only after that check. Write `summary.json` and print `SUMMARY_JSON`.
+
+Predict-only (`run_predict_only`) loads that bundle and then does step 7. It never calls `train_spec2fp`. A missing or incompatible bundle raises with the text `does not train`.
+
+Legitimate nearest-library padding to 25 guesses stays. "No fallback" means a failed required step raises instead of switching strategy or writing a dummy SMILES.
+
+## How to run on Kaggle
+
+GPU, Python 3.12, internet off. Kernel source stays under 1 MB. Execution budget is under 9 hours. Do not turn internet on to install packages; sklearn is already on the GPU image, and RDKit comes from the attached wheel.
+
+**Train and predict.** Upload `kaggle_gpu_submission.ipynb` (same bytes as `kaggle_submission.ipynb`). Add inputs:
+
+1. The competition dataset (`train.parquet`, `test.parquet`, `sample_submission.csv`).
+2. `class2_candidates.parquet`, the 452,608-row COCONUT ∪ LOTUS pool. Do not filter it on public test masses.
+3. The ~35 MB wheel `rdkit-2025.9.5-cp312-cp312-manylinux_2_28_x86_64.whl`. The 20 KB file named `rdkit-2025-9-5` is not a wheel.
+
+Optional: a dataset containing a previous `casmi_run/` whose hashes match this source. A source-hash change trains fresh. Run All.
+
+**Predict only.** After a train run finishes, download its `/kaggle/working/casmi_run/` output and upload that directory as its own Kaggle dataset. Attach the competition data, the same Class 2 pool, the RDKit wheel, and that dataset. Upload `kaggle_predict_only.ipynb`. Leave `BUNDLE_DIR = ""` when exactly one `run_manifest.json` is attached; if several are attached, set `BUNDLE_DIR` to the directory that contains the manifest. Run All.
+
+The bundle is `run_manifest.json`, `checkpoints/spec2fp_s{42,7,123}.pt`, `reranker.pkl`, `library.npz` + `library.json`, and `neighbor.npz` + `neighbor.json`. Deleting the Kaggle session deletes `/kaggle/working`. A laptop path is not visible on Kaggle. Only the dataset you upload survives.
+
+`summary.json` records strategy id, source hash, checkpoint hashes, complete seeds, reranker status, submission hash, row count, and per-stage elapsed time plus peak RSS. Those timings are measurements of that Kaggle run. Synthetic tests do not supply them.
 
 ## Code map
 
@@ -147,13 +158,15 @@ Kaggle constraints: **GPU session (P100/T4), internet off**, kernel source **< 1
 | `src/calibration.py` | Optional OR-merge probabilities. Ranking score used in the compete pool is the linear mix above, not only this table. |
 | `src/models/smiles_decoder.py` | Class 3 decoder. **Disabled.** |
 | `src/formula_head.py` | Built earlier, **disabled** in `predict_test` |
-| `src/rerank.py` | Unlocked-window reranker: 22 inference-only features, fixed `HistGradientBoostingClassifier` with monotonic constraints, query-balanced weights, refit-determinism check, save/load. Used only when the notebook's promotion rule passes. |
-| `src/validation.py` | Leak-free validation harness: tautomer-aware partitions outside the fit subset, acquisition pass, masked library, answer-in-pool external copy, fork-pool candidate generation with traces, both arms on identical pools, bootstrap CIs, `PROMOTION_RULE`, checkpoint completeness guard, strict submission check. |
-| `tests/test_ranking_gates.py`, `tests/test_reranker_experiment.py` | Synthetic gates (`python -m unittest discover -s tests`). No competition data, no fitting on real data. |
-| `scripts/make_kaggle_notebook.py` | Emits `kaggle_submission.ipynb`, `kaggle_gpu_submission.ipynb` (and the legacy `kaggle_submission_tpu.ipynb` name; all identical GPU notebooks) |
+| `src/rerank.py` | Unlocked-window reranker: 22 inference-only features, fixed `HistGradientBoostingClassifier` with monotonic constraints, query-balanced weights, refit-determinism check, atomic save/load. Non-finite scores raise. The scored run requires a fitted model. |
+| `src/validation.py` | Holdout machinery the train path uses for RR_TRAIN only: tautomer-aware partitions, masked library, answer-in-pool external copy, checkpoint completeness. `PROMOTION_RULE`, bootstrap, and the fork pool remain in the module and are not called by this path. |
+| `src/pipeline.py` | Required-reranker orchestration, caches, atomic publish, predict-only loader. |
+| `tests/test_ranking_gates.py`, `tests/test_reranker_experiment.py`, `tests/test_execution_workflow.py`, `tests/test_accuracy_fixes.py` | Synthetic gates (`python -m unittest discover -s tests`). No competition data, no fitting on real data. |
+| `scripts/make_kaggle_notebook.py` | Emits the three identical train-and-predict notebooks and `kaggle_predict_only.ipynb`. |
 | `scripts/build_class2_np.py` | Rebuilds the COCONUT ∪ LOTUS parquet. Needs `train.parquet` locally, which is not on disk. |
 | `kaggle_dataset/class2_candidates.parquet` | The 452,608-row library (also on Kaggle) |
-| `kaggle_submission.ipynb` / `kaggle_gpu_submission.ipynb` | What gets uploaded to Kaggle (GPU, internet off) |
+| `kaggle_gpu_submission.ipynb` | Train-and-predict notebook to upload (GPU, internet off). Identical to `kaggle_submission.ipynb` and `kaggle_submission_tpu.ipynb`. |
+| `kaggle_predict_only.ipynb` | Ranks from an attached verified `casmi_run/` dataset. Does not train. |
 
 ## Scored experiment — peak-support ranking (0.150)
 
@@ -168,21 +181,32 @@ The change versus 0.139 was ranking only. Training stayed focal BCE, 3 seeds, 12
 
 Keep this submission selected. Do not retune these four gates in the next run. The gain does not establish a path to 0.25 or 0.350.
 
-## Pending experiment — learned reranker for the unlocked pool (built 2026-10-07, not yet scored)
+## Next scored run — `required-reranker-v1` (not yet scored)
 
-**Hypothesis.** The hand-written compete score (`0.92 * (0.78 * tanimoto + 0.22 * mass)` for ~2,300 Class 2 candidates per query, `0.42/0.46/0.12` for weak Class 1) is the bottleneck for Class 2 molecules: the right skeleton is usually in the pool but not at rank 1. A small, regularized, source-aware gradient-boosted reranker applied to the top-200 unlocked candidates should place it higher. This is the only change versus 0.150.
+**Hypothesis.** The hand-written compete score is the bottleneck for Class 2: the right skeleton is usually in the pool but not at rank 1. The current 22-feature HistGradientBoosting reranker, applied to the top 200 unlocked candidates, is the only change versus the 0.150 ordering. Kaggle MRR@25 decides whether it is better. This run does not select the old baseline if the fit succeeds, and it does not claim 0.350.
 
-**Frozen.** Spec2FP recipe (focal BCE, 3 seeds, 120k, 4 epochs), neighbor blend, spectral gates, the Class 1 lock, candidate generation, analog generation, dedup, RDKit 2025.09.5, decoder off.
+**Frozen.** Spec2FP at 120k structures, four completed epochs, seeds 42/7/123, current architecture and batch size, focal BCE, last-epoch selection, pre-sigmoid logit averaging. Neighbor k=20, alpha=0.5. Current peak-support gates. Full 452,608-row pool. Decoder off. Weak Class 1 stays eligible. Same candidate generation, mass windows, and analog generation. Locked prefix and its order stay put.
 
-**Reranker** (`src/rerank.py`). sklearn `HistGradientBoostingClassifier`, one fixed configuration (`max_iter=150`, `lr=0.05`, `max_leaf_nodes=15`, `max_depth=4`, `min_samples_leaf=40`, `l2=1.0`, `random_state=0`, no early stopping), monotonic constraints on the similarity features, query-balanced sample weights, refit-determinism check. Features are per-candidate inference quantities only: spectral cosine / matched peaks / intensity fraction / evaluated flag, Tanimoto, fingerprint cosine, mass Gaussian, |ppm|, source one-hots (Class 1 / Class 2 / analog), the 0.150 linear score and its log-rank, margins to the pool maximum, pool-size context, and query context (mass, peak count, adduct groups). No answer fingerprint, no formula-derived query mass, no identity, no validation label.
+**Not repeated.** Dropping weak Class 1 (0.119), neighbor blend off (0.133), all-structure six-epoch training (0.126), representative-metadata training (0.134), and the rejected candidate-ranking loss (control 0.137).
 
-**Validation inside the Kaggle run** (`src/validation.py`). Holdout skeletons are drawn from the ~156k library rows outside the 120k fitting subset, keyed by tautomer-canonical InChIKey14, with any row whose tautomer alias sits in the fit subset excluded. Partitions are disjoint: `RR_TRAIN` 1200 (fit the reranker), `DEV` 400 (sanity only, never selection), `AUDIT` 800 (promotion decision), `PANEL` 400 (`enveda-np-examples`, Bruker, where eligible). Two regimes per skeleton: **U** (unseen: representative spectrum as the query, identity and aliases removed from the spectral library and the neighbor index, truth inserted into a validation copy of the Class 2 pool) and **K** (known: a different acquisition as the query, full library). Candidate pools are generated once with the production code; the rerank arm is reconstructed offline from the trace and verified equal to the production path. Diagnostics: coverage (truth locked / in window / in pool), false locks, MRR@25, Recall@1/5/25, truth-in-window-only slice, paired RR deltas with 4096-resample bootstrap CIs, per-query rows, candidate traces.
+**Reranker.** `max_iter=150`, `lr=0.05`, `max_leaf_nodes=15`, `max_depth=4`, `min_samples_leaf=40`, `l2=1.0`, `random_state=0`, no early stopping, monotonic constraints, query-balanced weights. Features stay the current 22 inference-only names. No answer fingerprint, no formula-derived query mass, no identity, no validation label.
 
-**Promotion rule (declared before the audit runs, `PROMOTION_RULE`):** AUDIT ≥ 300 ranked queries; pooled U+K paired ΔMRR ≥ +0.010; bootstrap 95% CI lower bound > 0; regime-K Δ ≥ −0.005; PANEL Δ ≥ −0.02 when PANEL has ≥ 50 queries; a reranker must have been fitted. Any failed or unmeasurable check ships the exact 0.150 ordering, and the manifest says why.
+**Training pairs.** Only `RR_TRAIN` (1200) and regimes U and K. U masks the library and the neighbor slice and inserts the truth into a copy of the external pool. K uses the full library, the production external pool, and an alternate acquisition. Pair features are cached under a signature of source, fit hash, library row order, checkpoint bytes, Class 2 bytes, features, booster params, window, and pair-source hash. Public test changes and operational paths do not invalidate that cache. DEV, AUDIT, PANEL, bootstrap, permutation importance, and the promotion rule are not executed. `PROMOTION_RULE` remains in `src/validation.py` for the old tests; it is not the submission selector.
 
-**What to read from the run.** `SUMMARY_JSON` on the last line (selected arm, audit MRR for both arms, CI, panel size, versions), `[rank:U]`/`[rank:K]` rates, `[holdout]` exclusions, the `[ok]/[FAIL]` lines under `DECISION`, and `test molecules where the two arms differ`. The validation estimate is not the public score: U uses library representatives with the truth inserted into the pool, so it bounds Class 2 behaviour from above; the hidden Class 3 share scores 0 in both arms.
+**What to read.** `STRATEGY_ACTIVE` before prediction, `SUBMISSION_READY` after the CSV check, and `SUMMARY_JSON` (strategy id, source hash, checkpoint hashes, complete seeds, reranker status, submission hash, row count, timings). There is no `DECISION` line and no selected-arm field.
 
-**Measured locally (synthetic data only).** 26 unit tests pass; a `FAST_DEV_RUN` dry run of the generated notebook on synthetic spectra executes every cell, including fitting, audit, decision, production ranking, artifacts, and the strict submission check. Nothing was trained or fitted on competition data locally. No public score exists for this experiment yet.
+## Inactive experiments (not in the scored run)
+
+**`precursor-mz-shift-v1`.** `_score_candidates` passes `cand_mass[pick]` (neutral exact mass) into `modified_cosine`, which subtracts it from the query precursor. The index now also stores the observed representative `precursor_mz` and never fills it from an answer formula. `cfg.use_observed_precursor` defaults to false. Turning it on uses the stored m/z and raises when that value is missing or non-finite. A synthetic pair (query peaks 100–130 at precursor 500, candidate peaks 50–80, neutral mass 450) scores above 0 on the default path and 0 when the flag is on. The scored recipe rejects the flag.
+
+**`official-inchikey14-v14`.** `official_metric_inchikey14` follows the version-14 sequence: `MolFromSmiles`, `RemoveStereochemistry`, a fresh default `TautomerEnumerator.Canonicalize`, then `MolToInchiKey[:14]`. Invalid SMILES returns `""`. Production dedup still calls `inchikey14_from_smiles`. On this laptop (RDKit 2026.03.6) the two functions return the same key for `C[C@H](O)CC` / `C[C@@H](O)CC`, for `CC(=O)CC(=O)C` / `CC(=O)C=C(C)O`, and for `CCO`. That does not measure the 452,608-row pool and does not measure RDKit 2026.03.3, which is not installed here. No label, dedup, or ordering change was applied. Do not pip-upgrade RDKit to run this comparison.
+
+## What was not measured
+
+- Public MRR@25 of `required-reranker-v1`. Keep 0.150 selected until a new public score is strictly higher.
+- Kaggle GPU wall time, peak memory, RR_TRAIN yield, and Class 2 load time. The manifest records them only after a real Kaggle run. Do not treat a synthetic test as that measurement, and do not cut epochs or seeds to fit a guessed timeout.
+- Whether `official_metric_inchikey14` differs from production dedup on the Class 2 pool or under RDKit 2026.03.3.
+- Fork-pool candidate generation on Kaggle Linux. This path does not use it. A local macOS fork pool hung after Torch/OpenMP initialized in the parent; that is why ranking here is one process.
 
 ## Rules for the next change
 
@@ -193,7 +217,7 @@ Keep this submission selected. Do not retune these four gates in the next run. T
 5. Do not enable the SMILES decoder.
 6. Do not filter Class 2 on public `test.parquet`.
 7. Any new structure library must be a new Kaggle dataset (packed fp parquet, 50–2000 Da, train keys removed). NPAtlas adds only ~2.5k structures on top of the current 453k and is not worth a run by itself.
-8. After editing `src/`, run `python scripts/make_kaggle_notebook.py` and upload the new `kaggle_submission.ipynb` (or `kaggle_gpu_submission.ipynb`; identical). Then run `python -m unittest discover -s tests`.
+8. After editing `src/`, run `python scripts/make_kaggle_notebook.py` and `python -m unittest discover -s tests`. Upload `kaggle_gpu_submission.ipynb` for a from-scratch run, or `kaggle_predict_only.ipynb` only with a verified `casmi_run` dataset.
 9. Leave the 0.150 submission selected on Kaggle until a new public score is strictly higher.
-10. Reranker features never include the answer's fingerprint, a formula-derived query mass, identity, or validation labels. `DEV` is never used for selection. The promotion rule is fixed before the audit runs; do not relax it after seeing the numbers.
-11. Any further change to the reranker (features, window, estimator) is a new single-hypothesis experiment with its own run.
+10. Reranker features never include the answer's fingerprint, a formula-derived query mass, identity, or validation labels. The scored run does not use a local promotion gate. `precursor-mz-shift-v1` and `official-inchikey14-v14` stay off until each has its own run.
+11. Any further change to the reranker (features, window, estimator), the precursor shift, or the identity function is a new single-hypothesis experiment with its own id.

@@ -8,6 +8,7 @@ partial last step.
 from __future__ import annotations
 
 import math
+import os
 import random
 import time
 from pathlib import Path
@@ -101,13 +102,16 @@ def _bit_metrics(logits: torch.Tensor, target: torch.Tensor) -> dict[str, float]
 
 
 def save_checkpoint(model: Spec2FP, path: Path, cfg: Config, extra: dict[str, Any] | None = None) -> None:
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
         "config": cfg.__dict__.copy(),
         "extra": extra or {},
     }
-    torch.save(payload, path)
+    tmp = path.with_name(path.name + ".partial")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
 
 
 def load_model(path: Path | str, cfg: Config | None = None, map_location: str | torch.device = "cpu") -> Spec2FP:

@@ -176,7 +176,9 @@ def rerank_scores(reranker: Any, X: np.ndarray) -> np.ndarray:
     scores = np.asarray(reranker.predict(np.asarray(X, dtype=np.float32)), dtype=np.float64).ravel()
     if scores.shape[0] != X.shape[0]:
         raise ValueError(f"reranker returned {scores.shape[0]} scores for {X.shape[0]} rows")
-    return np.nan_to_num(scores, nan=-1.0, posinf=1.0, neginf=-1.0)
+    if not np.isfinite(scores).all():
+        raise RuntimeError("non-finite reranker scores")
+    return scores
 
 
 def reranked_order(scores: np.ndarray) -> np.ndarray:
@@ -274,10 +276,14 @@ def fit_reranker(
 
 
 def save_reranker(reranker: LearnedReranker, path: Path | str) -> Path:
+    import os
+
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("wb") as fh:
+    tmp = path.with_name(path.name + ".partial")
+    with tmp.open("wb") as fh:
         pickle.dump(reranker, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, path)
     return path
 
 
