@@ -113,12 +113,12 @@ Train-and-predict (`run_train_and_predict`):
 1. Preflight. Move an existing `submission.csv` to `submission_previous_<utc>.csv`. Bound OpenMP/MKL/OpenBLAS/NumExpr and Torch threads to 4. Require CUDA, sklearn `HistGradientBoostingClassifier`, and a Class 2 parquet with exactly 452,608 rows.
 2. Build or load the spectral library and the neighbor bins. Caches are `library.npz` / `neighbor.npz` plus JSON sidecars (`casmi-spectral-library-v1`, `casmi-neighbor-bins-v1`). A cache is used only when schema, shapes, row-order hash, and input provenance match. The library cache is keyed by the train parquet content hash and the checkpoint source hash, not by `test.parquet`.
 3. Train or reuse seeds 42, 7, and 123. Save after each completed seed. An incomplete checkpoint raises.
-4. Build only the existing `RR_TRAIN` partition (1200 skeletons, validation seed 0) and its U and K regimes. Alias-in-fit rows stay excluded. Rank those queries in one process (`workers=1`). Do not rank DEV, AUDIT, or PANEL. Do not bootstrap, permute, or decide a promotion.
+4. Build only the existing `RR_TRAIN` partition (1200 skeletons, validation seed 0) and its U and K regimes. Alias-in-fit rows stay excluded. Rank those queries in one process (`workers=1`). After each query, atomically store its features, labels, and identity under `pair_shards/<pairs signature>/`. A resumed run ranks only the queries whose shard is missing or whose identity does not match. A different signature is not reused. Do not rank DEV, AUDIT, or PANEL. Do not bootstrap, permute, or decide a promotion.
 5. Fit the required reranker. A status other than `fitted` raises. There is no second estimator and no linear-score substitute.
 6. Predict the test set with neighbor blending required, decoder off, and uniform fingerprint predictions forbidden. Print `STRATEGY_ACTIVE` before prediction.
 7. Check the partial CSV, then `os.replace` it to `submission.csv`. Print `SUBMISSION_READY` only after that check. Write `summary.json` and print `SUMMARY_JSON`.
 
-Predict-only (`run_predict_only`) loads that bundle and then does step 7. It never calls `train_spec2fp`. A missing or incompatible bundle raises with the text `does not train`.
+Predict-only (`run_predict_only`) loads that bundle and then does step 7. It never calls `train_spec2fp`. Before it accepts the reranker it checks the artifact sha256, the reranker signature, the current `PAIRS_SOURCE` hash, and the attached Class 2 sha256 against `run_manifest.json`. A missing or incompatible bundle raises with the text `does not train`.
 
 Legitimate nearest-library padding to 25 guesses stays. "No fallback" means a failed required step raises instead of switching strategy or writing a dummy SMILES.
 

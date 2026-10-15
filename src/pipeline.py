@@ -37,6 +37,7 @@ EXPECTED_CLASS2_ROWS = 452_608
 LIBRARY_SCHEMA = "casmi-spectral-library-v1"
 NEIGHBOR_SCHEMA = "casmi-neighbor-bins-v1"
 PAIRS_SCHEMA = "casmi-reranker-pairs-v1"
+QUERY_SHARD_SCHEMA = "casmi-reranker-query-v1"
 MANIFEST_SCHEMA = "casmi-run-manifest-v1"
 
 CHECKPOINT_SOURCE = (
@@ -427,6 +428,144 @@ def training_signature(
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
+def _query_identity(query) -> dict[str, Any]:
+    truth = query.truth
+    return {
+        "qid": str(query.qid),
+        "partition": str(query.partition),
+        "regime": str(query.regime),
+        "row": int(query.row),
+        "truth_raw_key": str(truth.raw_key),
+        "truth_canonical": str(truth.canonical),
+        "truth_smiles": str(truth.smiles),
+    }
+
+
+def _query_shard_path(run_dir: Path, signature: str, qid: str) -> Path:
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(qid))
+    return Path(run_dir) / "pair_shards" / signature / f"{safe}.npz"
+
+
+def _load_query_shard(path: Path, identity: dict[str, Any], signature: str):
+    """Return ``(X, y)`` only when the shard matches this signature and identity."""
+    side = path.with_suffix(".json")
+    if not path.exists() or not side.exists():
+        return None
+    try:
+        meta = json.loads(side.read_text())
+        if meta.get("schema") != QUERY_SHARD_SCHEMA or meta.get("signature") != signature:
+            return None
+        if meta.get("identity") != identity:
+            return None
+        data = np.load(path)
+        X = np.asarray(data["X"], dtype=np.float32)
+        y = np.asarray(data["y"], dtype=np.int64).ravel()
+        if X.ndim != 2 or X.shape[1] != len(FEATURE_NAMES) or y.shape[0] != X.shape[0]:
+            raise PipelineError(f"query shard {path.name} has shape {getattr(X, 'shape', None)}")
+        if X.size and not np.isfinite(X).all():
+            raise PipelineError(f"query shard {path.name} has non-finite features")
+    except Exception as exc:
+        print(f"[pairs] shard {path.name} rejected: {exc}")
+        return None
+    return X, y
+
+
+def _save_query_shard(path: Path, identity: dict[str, Any], signature: str, X: np.ndarray, y: np.ndarray) -> None:
+    X = np.asarray(X, dtype=np.float32)
+    y = np.asarray(y, dtype=np.int64).ravel()
+    if X.ndim != 2 or X.shape[1] != len(FEATURE_NAMES) or y.shape[0] != X.shape[0]:
+        raise PipelineError(f"refusing to store query shard with shape {X.shape} labels {y.shape}")
+    atomic_savez(path, X=X, y=y)
+    atomic_write_json(path.with_suffix(".json"), {
+        "schema": QUERY_SHARD_SCHEMA,
+        "signature": signature,
+        "identity": identity,
+        "n_rows": int(X.shape[0]),
+    })
+
+
+def _stack_query_rows(queries, saved: dict[str, tuple[np.ndarray, np.ndarray]]):
+    xs: list[np.ndarray] = []
+    ys: list[np.ndarray] = []
+    qids: list[np.ndarray] = []
+    used = 0
+    for query in queries:
+        X, y = saved[query.qid]
+        if X.shape[0] == 0:
+            continue
+        xs.append(X)
+        ys.append(y)
+        qids.append(np.full(X.shape[0], used, dtype=np.int64))
+        used += 1
+    if not xs:
+        empty_x = np.zeros((0, len(FEATURE_NAMES)), dtype=np.float32)
+        empty = np.zeros((0,), dtype=np.int64)
+        return empty_x, empty, empty
+    return np.concatenate(xs), np.concatenate(ys), np.concatenate(qids)
+
+
+def assemble_saved_query_rows(run_dir: Path | str, signature: str, queries, produce):
+    """Load matching shards and call ``produce`` only for the queries still missing.
+
+    ``produce(query)`` returns that query's feature matrix and labels. A raise
+    leaves earlier shards in place. A different signature is a different
+    directory, so those shards are not reused.
+    """
+    run_dir = Path(run_dir)
+    saved: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    n_resumed = 0
+    for query in queries:
+        identity = _query_identity(query)
+        path = _query_shard_path(run_dir, signature, query.qid)
+        loaded = _load_query_shard(path, identity, signature)
+        if loaded is not None:
+            saved[query.qid] = loaded
+            n_resumed += 1
+            continue
+        X, y = produce(query)
+        _save_query_shard(path, identity, signature, X, y)
+        saved[query.qid] = (np.asarray(X, dtype=np.float32), np.asarray(y, dtype=np.int64).ravel())
+        print(f"[pairs] saved {query.qid} rows={saved[query.qid][0].shape[0]} signature={signature}")
+    print(f"[pairs] resumed {n_resumed}/{len(queries)} signature={signature}")
+    return _stack_query_rows(queries, saved)
+
+
+def _matrix_for_query(query, result) -> tuple[np.ndarray, np.ndarray]:
+    from src.validation import training_rows
+
+    X, y, _qid, _counts = training_rows([query], {query.qid: result})
+    return np.asarray(X, dtype=np.float32), np.asarray(y, dtype=np.int64).ravel()
+
+
+def reranker_provenance_problems(
+    manifest: dict[str, Any],
+    reranker_path: Path,
+    class2_sha256: str | None,
+) -> list[str]:
+    """Compare the attached reranker, pair source, and Class 2 file with the manifest."""
+    problems: list[str] = []
+    if manifest.get("pairs_source_hash") != source_hash(PAIRS_SOURCE):
+        problems.append("pairs source hash does not match the manifest")
+    recorded_class2 = manifest.get("class2_sha256")
+    if not class2_sha256 or not recorded_class2 or class2_sha256 != recorded_class2:
+        problems.append("class 2 content hash does not match the manifest")
+    expected = manifest.get("pairs_signature")
+    recorded = (manifest.get("reranker") or {}).get("signature")
+    recorded_hash = (manifest.get("reranker") or {}).get("sha256")
+    meta_path = reranker_path.with_suffix(".json")
+    file_sig = None
+    if meta_path.exists():
+        try:
+            file_sig = json.loads(meta_path.read_text()).get("signature")
+        except Exception:
+            file_sig = None
+    if not expected or recorded != expected or file_sig != expected:
+        problems.append("reranker signature does not match the manifest")
+    if not recorded_hash or not reranker_path.exists() or file_sha256(reranker_path) != recorded_hash:
+        problems.append("reranker artifact hash does not match the manifest")
+    return problems
+
+
 def fit_required_reranker(X: np.ndarray, y: np.ndarray, query_id: np.ndarray, *, min_queries: int = MIN_TRAIN_QUERIES):
     reranker, report = fit_reranker(X, y, query_id, min_queries=min_queries)
     if reranker is None or report.get("status") != "fitted":
@@ -533,7 +672,6 @@ def _rr_train_pairs(cfg: Config, index, external, neighbor, models, state: dict[
         masked_library,
         plan_holdouts,
         rank_queries,
-        training_rows,
     )
 
     fit_take = state["fit_take"]
@@ -569,10 +707,15 @@ def _rr_train_pairs(cfg: Config, index, external, neighbor, models, state: dict[
     keep = np.ones(len(index.smiles), dtype=bool)
     keep[np.fromiter(plan.masked_rows(), dtype=np.int64)] = False
     ext_val, _inserted = external_with_truths(external, [q.truth for q in u_queries], cfg)
+    pending = []
+    for query in queries:
+        if _load_query_shard(_query_shard_path(run_dir, signature, query.qid), _query_identity(query), signature) is None:
+            pending.append(query)
+    pending_ids = {query.qid for query in pending}
     pred = {}
-    for label, qs, lib, nbr in (
-        ("U", u_queries, masked, slice_neighbor(neighbor, keep)),
-        ("K", k_queries, index, neighbor),
+    for label, qs, nbr in (
+        ("U", [q for q in u_queries if q.qid in pending_ids], slice_neighbor(neighbor, keep)),
+        ("K", [q for q in k_queries if q.qid in pending_ids], neighbor),
     ):
         if not qs:
             continue
@@ -582,13 +725,25 @@ def _rr_train_pairs(cfg: Config, index, external, neighbor, models, state: dict[
             raise PipelineError(f"neighbor blend failed for regime {label}")
         for query, fp in zip(qs, fps):
             pred[query.qid] = fp
-    print(f"[pairs] ranking {len(u_queries)} U and {len(k_queries)} K queries in one process")
-    results = {}
-    results.update(rank_queries(u_queries, pred, masked, ext_val, cfg, workers=1, progress_every=20, label="U"))
-    results.update(rank_queries(k_queries, pred, index, external, cfg, workers=1, progress_every=20, label="K"))
-    if len(results) != len(queries):
-        raise PipelineError(f"candidate generation finished {len(results)}/{len(queries)} RR_TRAIN queries")
-    X, y, qid, counts = training_rows(queries, results)
+    print(f"[pairs] ranking {len(pending_ids)} remaining queries in one process")
+    ranked: dict[str, dict[str, Any]] = {}
+
+    def produce(query):
+        if query.qid in ranked:
+            return _matrix_for_query(query, ranked[query.qid])
+        group = u_queries if query.regime == "U" else k_queries
+        pool = masked if query.regime == "U" else index
+        ext = ext_val if query.regime == "U" else external
+        if query.qid not in {item.qid for item in group}:
+            raise PipelineError(f"{query.qid} is not an RR_TRAIN U or K query")
+        out = rank_queries([query], pred, pool, ext, cfg, workers=1, progress_every=1, label=query.regime)
+        if query.qid not in out:
+            raise PipelineError(f"candidate generation missed {query.qid}")
+        ranked[query.qid] = out[query.qid]
+        return _matrix_for_query(query, out[query.qid])
+
+    X, y, qid = assemble_saved_query_rows(run_dir, signature, queries, produce)
+    counts = {"rows": int(X.shape[0]), "queries_with_rows": int(np.unique(qid).size) if qid.size else 0}
     print("[pairs] training rows", X.shape, "counts", counts)
     atomic_savez(cache, X=X, y=y, qid=qid)
     atomic_write_json(side, {"schema": PAIRS_SCHEMA, "signature": signature, "counts": counts})
@@ -745,6 +900,7 @@ def run_train_and_predict(
     cfg.seed = 42
 
     class2_sha = file_sha256(cfg.external_candidates_path)
+    state["class2_sha256"] = class2_sha
     state["pairs_signature"] = training_signature(
         fit_hash=state["fit_subset_hash"],
         library_row_hash=row_hash,
@@ -763,13 +919,21 @@ def run_train_and_predict(
         meta = json.loads(meta_path.read_text())
         if meta.get("signature") == state["pairs_signature"]:
             reranker = load_reranker(reranker_path)
-            state["reranker"] = {"status": "reused", "signature": state["pairs_signature"]}
+            state["reranker"] = {
+                "status": "reused",
+                "signature": state["pairs_signature"],
+                "sha256": file_sha256(reranker_path),
+            }
             print("[reranker] reusing verified artifact")
     if reranker is None:
         reranker, report = fit_required_reranker(X, y, qid)
         save_reranker(reranker, reranker_path)
         atomic_write_json(meta_path, {"signature": state["pairs_signature"], "status": "fitted", "report": report})
-        state["reranker"] = {"status": "fitted", "signature": state["pairs_signature"]}
+        state["reranker"] = {
+            "status": "fitted",
+            "signature": state["pairs_signature"],
+            "sha256": file_sha256(reranker_path),
+        }
     _mark(state, run_dir, "reranker", t0)
     return _predict_and_publish(cfg, index, external, neighbor, models, reranker, run_dir, state, t0, submission_path)
 
@@ -846,15 +1010,23 @@ def run_predict_only(
             models.append(load_model(path, cfg))
             checkpoints[str(seed)] = {"sha256": file_sha256(path), "complete": True}
     reranker_path = bundle / "reranker.pkl"
+    class2_sha = None
+    if cfg.external_candidates_path is not None and Path(cfg.external_candidates_path).exists():
+        class2_sha = file_sha256(cfg.external_candidates_path)
     if not reranker_path.exists():
         problems.append("missing reranker")
         reranker = None
     else:
-        try:
-            reranker = load_reranker(reranker_path)
-        except Exception as exc:
-            problems.append(f"reranker unreadable: {exc}")
+        provenance = reranker_provenance_problems(manifest, reranker_path, class2_sha)
+        problems.extend(provenance)
+        if provenance:
             reranker = None
+        else:
+            try:
+                reranker = load_reranker(reranker_path)
+            except Exception as exc:
+                problems.append(f"reranker unreadable: {exc}")
+                reranker = None
     try:
         lib_data, lib_side = load_array_cache(bundle / "library.npz", expect_schema=LIBRARY_SCHEMA)
         nbr_data, nbr_side = load_array_cache(bundle / "neighbor.npz", expect_schema=NEIGHBOR_SCHEMA)

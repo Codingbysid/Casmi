@@ -25,13 +25,18 @@ from src.pipeline import (  # noqa: E402
     LIBRARY_SCHEMA,
     STRATEGY_ID,
     PipelineError,
+    _query_shard_path,
     _row_order_hash,
+    assemble_saved_query_rows,
     atomic_write_text,
+    file_sha256,
     fit_required_reranker,
     load_array_cache,
+    reranker_provenance_problems,
     run_predict_only,
     save_array_cache,
 )
+from src.validation import Query, Truth  # noqa: E402
 from src.rerank import FEATURE_NAMES, rerank_scores  # noqa: E402
 
 
@@ -140,6 +145,88 @@ class CacheAndPublishTests(unittest.TestCase):
         self.assertIn("does not train", str(ctx.exception))
         self.assertEqual(calls, [])
         self.assertEqual(STRATEGY_ID, "required-reranker-v1")
+
+    def test_query_shards_resume_and_a_new_signature_recomputes(self):
+        def query(row: int) -> Query:
+            return Query(
+                f"RR_TRAIN_U_{row}",
+                "RR_TRAIN",
+                "U",
+                row,
+                Truth("RAW", "CANON", "GRAPH", "CCO", 46.0),
+                {},
+                {},
+            )
+
+        queries = [query(1), query(2), query(3)]
+
+        def rows(q: Query):
+            x = np.full((2, len(FEATURE_NAMES)), float(q.row), dtype=np.float32)
+            y = np.array([1, 0], dtype=np.int64)
+            return x, y
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            calls = []
+
+            def produce(q: Query):
+                calls.append(q.qid)
+                if q.qid == "RR_TRAIN_U_2":
+                    raise RuntimeError("interrupted")
+                return rows(q)
+
+            with self.assertRaises(RuntimeError):
+                assemble_saved_query_rows(run, "sig-a", queries, produce)
+            self.assertEqual(calls, ["RR_TRAIN_U_1", "RR_TRAIN_U_2"])
+            first = _query_shard_path(run, "sig-a", "RR_TRAIN_U_1")
+            digest = file_sha256(first)
+            calls.clear()
+
+            def resume(q: Query):
+                calls.append(q.qid)
+                return rows(q)
+
+            X, y, qid = assemble_saved_query_rows(run, "sig-a", queries, resume)
+            self.assertEqual(calls, ["RR_TRAIN_U_2", "RR_TRAIN_U_3"])
+            self.assertEqual(file_sha256(first), digest)
+            self.assertEqual(X.shape, (6, len(FEATURE_NAMES)))
+            self.assertEqual(y.tolist(), [1, 0, 1, 0, 1, 0])
+            self.assertEqual(qid.tolist(), [0, 0, 1, 1, 2, 2])
+            calls.clear()
+            assemble_saved_query_rows(run, "sig-b", queries, resume)
+            self.assertEqual(calls, ["RR_TRAIN_U_1", "RR_TRAIN_U_2", "RR_TRAIN_U_3"])
+
+    def test_predict_only_checks_reranker_and_class2_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "reranker.pkl"
+            path.write_bytes(b"reranker-bytes")
+            digest = file_sha256(path)
+            (Path(tmp) / "reranker.json").write_text(json.dumps({"signature": "pair-sig"}))
+            manifest = {
+                "pairs_source_hash": "not-the-source",
+                "pairs_signature": "pair-sig",
+                "class2_sha256": "class2-a",
+                "reranker": {"signature": "pair-sig", "sha256": digest},
+            }
+            problems = reranker_provenance_problems(manifest, path, "class2-b")
+            self.assertIn("pairs source hash does not match the manifest", problems)
+            self.assertIn("class 2 content hash does not match the manifest", problems)
+            manifest["pairs_source_hash"] = __import__(
+                "src.pipeline", fromlist=["source_hash"]
+            ).source_hash(__import__("src.pipeline", fromlist=["PAIRS_SOURCE"]).PAIRS_SOURCE)
+            manifest["class2_sha256"] = "class2-b"
+            self.assertEqual(reranker_provenance_problems(manifest, path, "class2-b"), [])
+            manifest["reranker"]["sha256"] = "0" * 64
+            self.assertIn(
+                "reranker artifact hash does not match the manifest",
+                reranker_provenance_problems(manifest, path, "class2-b"),
+            )
+            manifest["reranker"]["sha256"] = digest
+            manifest["reranker"]["signature"] = "other"
+            self.assertIn(
+                "reranker signature does not match the manifest",
+                reranker_provenance_problems(manifest, path, "class2-b"),
+            )
 
 
 class NotebookWorkflowTests(unittest.TestCase):
