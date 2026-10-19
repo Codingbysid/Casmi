@@ -124,9 +124,11 @@ Legitimate nearest-library padding to 25 guesses stays. "No fallback" means a fa
 
 ## How to run on Kaggle
 
-GPU, Python 3.12, internet off. Kernel source stays under 1 MB. Execution budget is under 9 hours. Do not turn internet on to install packages; sklearn is already on the GPU image, and RDKit comes from the attached wheel.
+GPU, Python 3.12, internet off. Kernel source stays under 1 MB. The competition kills a notebook at **9 hours**, including the hidden-test rerun that happens when you press Submit. That rerun does not keep `/kaggle/working` from the previous session. Do not turn internet on to install packages; sklearn is already on the GPU image, and RDKit comes from the attached wheel.
 
-**Train and predict.** Upload `kaggle_gpu_submission.ipynb` (same bytes as `kaggle_submission.ipynb`). Add inputs:
+`notebook567717fe37` Version 7 hit that limit and produced no score. Submitting the train notebook again will do the same: it rebuilds the library, trains three seeds (up to 1.5 h each), ranks about 2,400 RR_TRAIN queries, and only then ranks the hidden test. Do not shrink epochs or the ensemble to squeeze under the limit. Submit the predict-only notebook once a bundle exists.
+
+**Train, then stop.** Upload `kaggle_gpu_submission.ipynb` (same bytes as `kaggle_submission.ipynb`). Use **Save & Run All**. Do not Submit this version. Add inputs:
 
 1. The competition dataset (`train.parquet`, `test.parquet`, `sample_submission.csv`).
 2. `class2_candidates.parquet`, the 452,608-row COCONUT ∪ LOTUS pool. Do not filter it on public test masses.

@@ -802,7 +802,12 @@ def run_train_and_predict(
     source_commit: str = "",
     require_cuda: bool = True,
 ) -> dict[str, Any]:
-    """Full required-reranker run. A failed fit or a missing seed raises."""
+    """Full required-reranker run. A failed fit or a missing seed raises.
+
+    Kaggle kills every notebook at 9 hours, and Submit reruns from scratch on
+    the hidden test. This function is the training run. The submission rerun
+    is ``run_predict_only`` with the saved ``casmi_run`` attached.
+    """
     del require_cuda  # CUDA is checked when the seeds load; a CPU device raises
     from src.data import dataset_from_structure_index, fitting_subset_indices
     from src.infer import build_library_from_train
@@ -813,6 +818,11 @@ def run_train_and_predict(
     if bool(getattr(cfg, "use_observed_precursor", False)):
         raise PipelineError(f"{PRECURSOR_EXPERIMENT_ID} is not part of {STRATEGY_ID}")
     assert_production_recipe(cfg)
+    print(
+        "[budget] competition limit is 9h and a Submit rerun starts from scratch on the hidden test. "
+        "Do not submit this train notebook. After SUBMISSION_READY, download casmi_run and submit "
+        "kaggle_predict_only.ipynb with that directory attached."
+    )
     bound_threads(4)
     run_dir = Path(run_dir)
     (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)

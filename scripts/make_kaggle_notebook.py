@@ -145,7 +145,9 @@ This run always fits the current 22-feature HistGradientBoosting reranker on RR_
 
 Inactive experiments (not applied): `precursor-mz-shift-v1`, `official-inchikey14-v14`.
 
-Keep the 0.150 submission selected until this public score is strictly higher. Do not treat an unmeasured number as 0.350.
+Do not press Submit on this notebook. A submission reruns it from scratch on the hidden test, and the competition kills every notebook at 9 hours. Training three seeds plus RR_TRAIN pairs plus that hidden test does not fit. Use Save & Run All, download `casmi_run`, and submit `kaggle_predict_only.ipynb` with that directory attached.
+
+Keep the 0.150 submission selected until a new public score is strictly higher. Do not treat an unmeasured number as 0.350. Version 7 (`notebook567717fe37`) timed out under that 9-hour limit and has no score.
 """,
     )
     _common(train, files, source_commit, source_dirty)
